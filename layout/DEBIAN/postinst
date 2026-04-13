@@ -1,9 +1,0 @@
-set -e
-
-if [ -d "/Library/PreferenceBundles/LiquidAssPrefs.bundle" ]; then
-    /usr/bin/sudo /usr/bin/ldid -S /Library/PreferenceBundles/LiquidAssPrefs.bundle/LiquidAssPrefs
-else
-    /var/jb/usr/bin/sudo /var/jb/usr/bin/ldid -S /var/jb/Library/PreferenceBundles/LiquidAssPrefs.bundle/LiquidAssPrefs
-fi
-
-exit 0

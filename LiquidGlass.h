@@ -42,6 +42,7 @@ CGPoint  LG_getLockscreenWallpaperOrigin(void);
 void     LG_cacheFolderSnapshot(void);
 void     LG_invalidateFolderSnapshot(void);
 void     LG_refreshHomescreenSnapshot(void);
+void     LGInvalidateLockscreenSnapshotCache(void);
 
 @interface LiquidGlassView : UIView <MTKViewDelegate>
 

@@ -1,109 +1,7 @@
 #import "LGGlassRenderer.h"
+#import "LGMetalShaderSource.h"
 #import <CoreVideo/CoreVideo.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
-
-static NSString * const kLGSharedMetalSource = @"// fullscreen quad + glass shading\n"
-    "#include <metal_stdlib>\n"
-    "using namespace metal;\n"
-    "struct Uniforms {\n"
-    "    float2 resolution;\n"
-    "    float2 screenResolution;\n"
-    "    float2 cardOrigin;\n"
-    "    float2 wallpaperResolution;\n"
-    "    float  radius;\n"
-    "    float  bezelWidth;\n"
-    "    float  glassThickness;\n"
-    "    float  refractionScale;\n"
-    "    float  refractiveIndex;\n"
-    "    float  specularOpacity;\n"
-    "    float  specularAngle;\n"
-    "    float  blur;\n"
-    "    float2 wallpaperOrigin;\n"
-    "};\n"
-    "float surfaceConvexSquircle(float x) { return pow(1.0 - pow(1.0 - x, 4.0), 0.25); }\n"
-    "float2 refractRay(float2 normal, float eta) {\n"
-    "    float cosI = -normal.y;\n"
-    "    float k = 1.0 - eta * eta * (1.0 - cosI * cosI);\n"
-    "    if (k < 0.0) return float2(0.0);\n"
-    "    float kSqrt = sqrt(k);\n"
-    "    return float2(-(eta * cosI + kSqrt) * normal.x, eta - (eta * cosI + kSqrt) * normal.y);\n"
-    "}\n"
-    "float rawRefraction(float bezelRatio, float glassThickness, float bezelWidth, float eta) {\n"
-    "    float x = clamp(bezelRatio, 0.05, 0.95);\n"
-    "    float y = surfaceConvexSquircle(x);\n"
-    "    float y2 = surfaceConvexSquircle(x + 0.001);\n"
-    "    float deriv = (y2 - y) / 0.001;\n"
-    "    float mag = sqrt(deriv * deriv + 1.0);\n"
-    "    float2 n = float2(-deriv / mag, -1.0 / mag);\n"
-    "    float2 r = refractRay(n, eta);\n"
-    "    if (length(r) < 0.0001 || abs(r.y) < 0.0001) return 0.0;\n"
-    "    float remaining = y * bezelWidth + glassThickness;\n"
-    "    return r.x * (remaining / r.y);\n"
-    "}\n"
-    "float displacementAtRatio(float bezelRatio, float glassThickness, float bezelWidth, float eta) {\n"
-    "    float peak = rawRefraction(0.05, glassThickness, bezelWidth, eta);\n"
-    "    if (abs(peak) < 0.0001) return 0.0;\n"
-    "    float raw = rawRefraction(bezelRatio, glassThickness, bezelWidth, eta);\n"
-    "    float norm = raw / peak;\n"
-    "    float falloff = 1.0 - smoothstep(0.0, 1.0, bezelRatio);\n"
-    "    return norm * falloff;\n"
-    "}\n"
-    "struct VertexOut { float4 position [[position]]; float2 localUV; };\n"
-    "vertex VertexOut vertexShader(uint vid [[vertex_id]]) {\n"
-    "    float2 pos[6] = { float2(-1,-1), float2(1,-1), float2(-1,1), float2(-1,1), float2(1,-1), float2(1,1) };\n"
-    "    float2 uv[6] = { float2(0,1), float2(1,1), float2(0,0), float2(0,0), float2(1,1), float2(1,0) };\n"
-    "    VertexOut out; out.position = float4(pos[vid], 0, 1); out.localUV = uv[vid]; return out;\n"
-    "}\n"
-    "fragment float4 fragmentShader(VertexOut in [[stage_in]], texture2d<float> blurredTex [[texture(0)]], constant Uniforms& u [[buffer(0)]]) {\n"
-    "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
-    "    float2 px = in.localUV * u.resolution;\n"
-    "    float W = u.resolution.x, H = u.resolution.y;\n"
-    "    float R = u.radius, bezel = u.bezelWidth;\n"
-    "    float eta = 1.0 / u.refractiveIndex;\n"
-    "    bool inLeft = px.x < R, inRight = px.x > W - R;\n"
-    "    bool inTop = px.y < R, inBottom = px.y > H - R;\n"
-    "    bool inCorner = (inLeft || inRight) && (inTop || inBottom);\n"
-    "    float cx = inLeft ? px.x - R : inRight ? px.x - (W - R) : 0.0;\n"
-    "    float cy = inTop ? px.y - R : inBottom ? px.y - (H - R) : 0.0;\n"
-    "    float distFromCenter = length(float2(cx, cy));\n"
-    "    if (inCorner && distFromCenter > R + 1.0) discard_fragment();\n"
-    "    float distFromSide; float2 dir;\n"
-    "    if (inCorner) {\n"
-    "        distFromSide = max(0.0, R - distFromCenter);\n"
-    "        dir = distFromCenter > 0.001 ? normalize(float2(cx, cy)) : float2(0);\n"
-    "    } else {\n"
-    "        float dL = px.x, dR = W - px.x, dT = px.y, dB = H - px.y;\n"
-    "        float dMin = min(min(dL, dR), min(dT, dB));\n"
-    "        distFromSide = dMin;\n"
-    "        dir = float2((dL < dR && dL == dMin) ? -1.0 : (dR <= dL && dR == dMin) ? 1.0 : 0.0,\n"
-    "                     (dT < dB && dT == dMin) ? -1.0 : (dB <= dT && dB == dMin) ? 1.0 : 0.0);\n"
-    "    }\n"
-    "    float edgeOpacity = inCorner ? clamp(1.0 - max(0.0, distFromCenter - R), 0.0, 1.0) : 1.0;\n"
-    "    float bezelRatio = clamp(distFromSide / bezel, 0.0, 1.0);\n"
-    "    float normDisp = (distFromSide < bezel) ? displacementAtRatio(bezelRatio, u.glassThickness, bezel, eta) : 0.0;\n"
-    "    float2 dispPx = -dir * normDisp * bezel * u.refractionScale * edgeOpacity;\n"
-    "    float2 screenPx = u.cardOrigin + px + dispPx;\n"
-    "    float2 imgPx = screenPx - u.wallpaperOrigin;\n"
-    "    float2 sampleUV = clamp(imgPx / u.wallpaperResolution, 0.0, 1.0);\n"
-    "    float4 bgColor = blurredTex.sample(s, sampleUV);\n"
-    "    float topBand = smoothstep(0.24, 0.02, in.localUV.y) * smoothstep(0.0, 0.18, in.localUV.y);\n"
-    "    float centerFeather = smoothstep(0.0, 0.18, in.localUV.x) * smoothstep(0.0, 0.18, 1.0 - in.localUV.x);\n"
-    "    float interiorHighlight = topBand * centerFeather * 0.42 * edgeOpacity;\n"
-    "    float2 lightDir = float2(cos(u.specularAngle), -sin(u.specularAngle));\n"
-    "    float specDot = dot(dir, lightDir);\n"
-    "    float strokePx = 1.5;\n"
-    "    float strokeMask = clamp(1.0 - (distFromSide / strokePx), 0.0, 1.0);\n"
-    "    float lobeStart = 0.66;\n"
-    "    float lobeWidth = 0.14;\n"
-    "    float primary = smoothstep(lobeStart, lobeStart + lobeWidth, specDot);\n"
-    "    float secondary = smoothstep(lobeStart, lobeStart + lobeWidth, -specDot);\n"
-    "    float cornerSpec = smoothstep(0.52, 0.88, abs(specDot));\n"
-    "    float specLobe = inCorner ? cornerSpec : (primary + secondary);\n"
-    "    float specular = specLobe * strokeMask * u.specularOpacity * 1.45 * edgeOpacity;\n"
-    "    specular += interiorHighlight * u.specularOpacity;\n"
-    "    bgColor.rgb += specular;\n"
-    "    return float4(bgColor.rgb, edgeOpacity);\n"
-    "}\n";
 
 typedef struct {
     vector_float2 resolution;
@@ -119,12 +17,23 @@ typedef struct {
     float specularAngle;
     float blur;
     vector_float2 wallpaperOrigin;
+    float samplingOrientation;
 } LGSharedUniforms;
 
 static id<MTLDevice> sLGDevice;
 static id<MTLRenderPipelineState> sLGPipeline;
 static id<MTLCommandQueue> sLGCommandQueue;
 static NSMapTable<UIImage *, NSMutableDictionary<NSNumber *, id> *> *sLGTextureCache;
+
+static UIImage *LGSharedNormalizedImageForUpload(UIImage *image) {
+    if (!image) return nil;
+    if (image.imageOrientation == UIImageOrientationUp) return image;
+    UIGraphicsBeginImageContextWithOptions(image.size, NO, image.scale);
+    [image drawInRect:CGRectMake(0, 0, image.size.width, image.size.height)];
+    UIImage *normalized = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return normalized ?: image;
+}
 
 static CGColorSpaceRef LGSharedRGBColorSpace(void) {
     static CGColorSpaceRef sColorSpace = nil;
@@ -137,11 +46,16 @@ static CGColorSpaceRef LGSharedRGBColorSpace(void) {
 
 @interface LGSharedTextureCacheEntry : NSObject
 @property (nonatomic, strong) id<MTLTexture> bgTexture;
-@property (nonatomic, strong) id<MTLTexture> blurredTexture;
 @property (nonatomic, strong) id bridge;
-@property (nonatomic, assign) float bakedBlurRadius;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, id> *blurVariants;
 @end
 @implementation LGSharedTextureCacheEntry @end
+
+@interface LGSharedBlurVariant : NSObject
+@property (nonatomic, strong) id<MTLTexture> texture;
+@property (nonatomic, assign) float bakedBlurRadius;
+@end
+@implementation LGSharedBlurVariant @end
 
 @interface LGSharedZeroCopyBridge : NSObject
 @property (nonatomic, strong) id<MTLDevice> device;
@@ -220,6 +134,11 @@ static NSNumber *LGTextureScaleKey(CGFloat scale) {
     return @(MAX(milli, 1));
 }
 
+static NSNumber *LGBlurSettingKey(CGFloat blur) {
+    NSInteger milli = (NSInteger)lrint(fmax(0.0, blur) * 1000.0);
+    return @(MAX(milli, 0));
+}
+
 static LGSharedTextureCacheEntry *LGGetCacheForImage(UIImage *image, CGFloat scale) {
     NSDictionary *variants = [sLGTextureCache objectForKey:image];
     return variants[LGTextureScaleKey(scale)];
@@ -240,7 +159,7 @@ void LGEnsureSharedGlassPipelinesReady(void) {
         sLGDevice = MTLCreateSystemDefaultDevice();
         if (!sLGDevice) return;
         NSError *error = nil;
-        id<MTLLibrary> library = [sLGDevice newLibraryWithSource:kLGSharedMetalSource
+        id<MTLLibrary> library = [sLGDevice newLibraryWithSource:LGGlassMetalSource()
                                                          options:[MTLCompileOptions new]
                                                            error:&error];
         if (!library) return;
@@ -396,23 +315,64 @@ void LGEnsureSharedGlassPipelinesReady(void) {
 - (BOOL)refreshVisualMetrics {
     CGFloat scale = UIScreen.mainScreen.scale;
     CGRect visualRect;
-    CALayer *pres = self.layer.presentationLayer ?: self.layer;
-    CALayer *root = pres;
-    while (root.superlayer) root = root.superlayer.presentationLayer ?: root.superlayer;
-    if (root != pres) {
-        CGRect rect = pres.bounds;
-        CALayer *current = pres;
-        while (current && current != root) {
-            CALayer *up = current.superlayer;
-            if (!up) break;
-            CALayer *upPres = up.presentationLayer ?: up;
-            rect = [current convertRect:rect toLayer:upPres];
-            current = upPres;
+    BOOL useDirectScreenConversion = (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad &&
+                                      self.window != nil);
+    if (useDirectScreenConversion) {
+        CGRect screenRect = self.window.windowScene
+            ? [self convertRect:self.bounds toCoordinateSpace:UIScreen.mainScreen.coordinateSpace]
+            : [self convertRect:self.bounds toView:nil];
+        visualRect = CGRectMake(screenRect.origin.x * scale,
+                                screenRect.origin.y * scale,
+                                screenRect.size.width * scale,
+                                screenRect.size.height * scale);
+    } else if (self.window) {
+        CALayer *pres = self.layer.presentationLayer ?: self.layer;
+        CALayer *windowLayer = self.window.layer.presentationLayer ?: self.window.layer;
+        CGRect windowScreenRect = self.window.windowScene
+            ? [self.window convertRect:self.window.bounds toCoordinateSpace:UIScreen.mainScreen.coordinateSpace]
+            : [self.window convertRect:self.window.bounds toView:nil];
+        if (pres != windowLayer) {
+            CGRect rect = pres.bounds;
+            CALayer *current = pres;
+            while (current && current != windowLayer) {
+                CALayer *up = current.superlayer;
+                if (!up) break;
+                CALayer *upPres = up.presentationLayer ?: up;
+                rect = [current convertRect:rect toLayer:upPres];
+                current = upPres;
+            }
+            visualRect = CGRectMake((windowScreenRect.origin.x + rect.origin.x) * scale,
+                                    (windowScreenRect.origin.y + rect.origin.y) * scale,
+                                    rect.size.width * scale,
+                                    rect.size.height * scale);
+        } else {
+            CGRect screenRect = self.window.windowScene
+                ? [self convertRect:self.bounds toCoordinateSpace:UIScreen.mainScreen.coordinateSpace]
+                : [self convertRect:self.bounds toView:nil];
+            visualRect = CGRectMake(screenRect.origin.x * scale,
+                                    screenRect.origin.y * scale,
+                                    screenRect.size.width * scale,
+                                    screenRect.size.height * scale);
         }
-        visualRect = CGRectMake(rect.origin.x * scale, rect.origin.y * scale, rect.size.width * scale, rect.size.height * scale);
     } else {
-        CGPoint origin = [self convertPoint:CGPointZero toView:nil];
-        visualRect = CGRectMake(origin.x * scale, origin.y * scale, self.bounds.size.width * scale, self.bounds.size.height * scale);
+        CALayer *pres = self.layer.presentationLayer ?: self.layer;
+        CALayer *root = pres;
+        while (root.superlayer) root = root.superlayer.presentationLayer ?: root.superlayer;
+        if (root != pres) {
+            CGRect rect = pres.bounds;
+            CALayer *current = pres;
+            while (current && current != root) {
+                CALayer *up = current.superlayer;
+                if (!up) break;
+                CALayer *upPres = up.presentationLayer ?: up;
+                rect = [current convertRect:rect toLayer:upPres];
+                current = upPres;
+            }
+            visualRect = CGRectMake(rect.origin.x * scale, rect.origin.y * scale, rect.size.width * scale, rect.size.height * scale);
+        } else {
+            CGPoint origin = [self convertPoint:CGPointZero toView:nil];
+            visualRect = CGRectMake(origin.x * scale, origin.y * scale, self.bounds.size.width * scale, self.bounds.size.height * scale);
+        }
     }
     CGSize drawableSize = _mtkView.drawableSize;
     float drawableW = self.bounds.size.width * scale;
@@ -446,7 +406,7 @@ void LGEnsureSharedGlassPipelinesReady(void) {
 }
 
 - (void)reloadTexture {
-    UIImage *image = self.sourceImage;
+    UIImage *image = LGSharedNormalizedImageForUpload(self.sourceImage);
     if (!image || !sLGDevice) return;
     NSUInteger srcW = (NSUInteger)lrint(image.size.width * image.scale);
     NSUInteger srcH = (NSUInteger)lrint(image.size.height * image.scale);
@@ -459,9 +419,10 @@ void LGEnsureSharedGlassPipelinesReady(void) {
     if (cached) {
         _cacheEntry = cached;
         _bgTexture = cached.bgTexture;
-        _blurredTexture = cached.blurredTexture;
-        _needsBlurBake = (cached.bakedBlurRadius != _blur);
-        _lastBakedBlurRadius = cached.bakedBlurRadius;
+        LGSharedBlurVariant *variant = cached.blurVariants[LGBlurSettingKey(_blur)];
+        _blurredTexture = variant.texture;
+        _needsBlurBake = (variant.texture == nil);
+        _lastBakedBlurRadius = variant.texture ? variant.bakedBlurRadius : -1;
         if (_releasesSourceAfterUpload) _sourceImage = nil;
         return;
     }
@@ -477,12 +438,11 @@ void LGEnsureSharedGlassPipelinesReady(void) {
                                                                                           height:height
                                                                                        mipmapped:NO];
     descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    _blurredTexture = [sLGDevice newTextureWithDescriptor:descriptor];
+    _blurredTexture = nil;
     LGSharedTextureCacheEntry *entry = [LGSharedTextureCacheEntry new];
     entry.bgTexture = _bgTexture;
-    entry.blurredTexture = _blurredTexture;
     entry.bridge = bridge;
-    entry.bakedBlurRadius = -1;
+    entry.blurVariants = [NSMutableDictionary dictionary];
     _cacheEntry = entry;
     LGSetCacheForImage(image, textureScale, entry);
     _needsBlurBake = YES;
@@ -506,6 +466,16 @@ void LGEnsureSharedGlassPipelinesReady(void) {
     [blur encodeToCommandBuffer:commandBuffer sourceTexture:_bgTexture destinationTexture:_blurredTexture];
 }
 
+- (void)ensureBlurTexture {
+    if (_blurredTexture || !_bgTexture) return;
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                           width:_bgTexture.width
+                                                                                          height:_bgTexture.height
+                                                                                       mipmapped:NO];
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    _blurredTexture = [sLGDevice newTextureWithDescriptor:descriptor];
+}
+
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat scale = UIScreen.mainScreen.scale;
@@ -527,6 +497,7 @@ void LGEnsureSharedGlassPipelinesReady(void) {
 
 - (void)drawInMTKView:(MTKView *)view {
     if (!_bgTexture && self.sourceImage) [self reloadTexture];
+    if (_bgTexture && !_blurredTexture) [self ensureBlurTexture];
     if (!sLGPipeline || !_bgTexture || !_blurredTexture) return;
     [self refreshVisualMetrics];
     CGSize drawableSize = _cachedDrawableSizePx;
@@ -537,12 +508,8 @@ void LGEnsureSharedGlassPipelinesReady(void) {
     id<MTLCommandBuffer> commandBuffer = [sLGCommandQueue commandBuffer];
     if (!commandBuffer) return;
     CGFloat scale = UIScreen.mainScreen.scale;
-    static CGFloat screenW = 0;
-    static CGFloat screenH = 0;
-    if (!screenW || !screenH) {
-        screenW = UIScreen.mainScreen.bounds.size.width * scale;
-        screenH = UIScreen.mainScreen.bounds.size.height * scale;
-    }
+    CGFloat screenW = UIScreen.mainScreen.bounds.size.width * scale;
+    CGFloat screenH = UIScreen.mainScreen.bounds.size.height * scale;
     float visOriginX = CGRectGetMinX(_cachedVisualRectPx);
     float visOriginY = CGRectGetMinY(_cachedVisualRectPx);
     float visW = CGRectGetWidth(_cachedVisualRectPx);
@@ -552,11 +519,25 @@ void LGEnsureSharedGlassPipelinesReady(void) {
     float imgH = (float)_bgTexture.height;
     float fillScale = fmaxf((float)screenW / imgW, (float)screenH / imgH);
     float blurPx = (float)_blur * (float)scale / fillScale;
+    if ((_needsBlurBake || blurPx != _lastBakedBlurRadius) && _cacheEntry) {
+        LGSharedBlurVariant *variant = _cacheEntry.blurVariants[LGBlurSettingKey(_blur)];
+        if (variant.texture) {
+            _blurredTexture = variant.texture;
+            _lastBakedBlurRadius = variant.bakedBlurRadius;
+            _needsBlurBake = NO;
+        }
+    }
     if (_needsBlurBake || blurPx != _lastBakedBlurRadius) {
+        [self ensureBlurTexture];
         [self runBlurPassWithRadius:blurPx commandBuffer:commandBuffer];
         _lastBakedBlurRadius = blurPx;
         _needsBlurBake = NO;
-        if (_cacheEntry) _cacheEntry.bakedBlurRadius = _blur;
+        if (_cacheEntry) {
+            LGSharedBlurVariant *variant = [LGSharedBlurVariant new];
+            variant.texture = _blurredTexture;
+            variant.bakedBlurRadius = blurPx;
+            _cacheEntry.blurVariants[LGBlurSettingKey(_blur)] = variant;
+        }
     }
     id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:passDescriptor];
     LGSharedUniforms uniforms = {
@@ -573,6 +554,7 @@ void LGEnsureSharedGlassPipelinesReady(void) {
         .specularAngle = 2.2689280f,
         .blur = blurPx,
         .wallpaperOrigin = { (float)(_sourceOriginPt.x * scale), (float)(_sourceOriginPt.y * scale) },
+        .samplingOrientation = 1.0f,
     };
     [encoder setRenderPipelineState:sLGPipeline];
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:0];

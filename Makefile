@@ -8,9 +8,12 @@ include $(THEOS)/makefiles/common.mk
 include ./locatesim.mk
 
 TWEAK_NAME = liquidass
-liquidass_FILES = Tweak.x Hooks/FolderIcon.x Hooks/AppIcons.x Hooks/ContextMenu.x Hooks/Dock.x Hooks/FolderOpen.x Hooks/Lockscreen/Common.x Hooks/Lockscreen/Notifications.x Hooks/Lockscreen/QuickActions.x Hooks/AppLibrary.x Hooks/Widgets.x
-liquidass_CFLAGS = -fobjc-arc
-liquidass_FRAMEWORKS = UIKit MetalKit
+HOOK_FILES := $(wildcard Hooks/*.x) $(wildcard Hooks/Lockscreen/*.x)
+SHARED_FILES := Shared/LGMetalShaderSource.m Shared/LGGlassRenderer.m
+PREF_CONTROL_FILES := LiquidAssPrefs/LGPrefsLiquidSlider.m LiquidAssPrefs/LGPrefsLiquidSwitch.m
+$(TWEAK_NAME)_FILES = Tweak.x $(HOOK_FILES) $(SHARED_FILES) $(PREF_CONTROL_FILES)
+$(TWEAK_NAME)_CFLAGS = -fobjc-arc
+$(TWEAK_NAME)_FRAMEWORKS = UIKit MetalKit
 
 include $(THEOS)/makefiles/tweak.mk
 SUBPROJECTS += LiquidAssPrefs

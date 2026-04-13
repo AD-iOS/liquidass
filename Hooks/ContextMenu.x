@@ -3,6 +3,7 @@
 
 static const NSInteger kContextMenuGlassTag     = 0xBEEF;
 static const NSInteger kContextMenuTintTag      = 0xDEAD;
+static const NSInteger kContextMenuDividerTag   = 0xD171;
 static CFStringRef const kLGPrefsChangedNotification = CFSTR("dylv.liquidassprefs/Reload");
 
 static BOOL LGContextMenuEnabled(void) { return LG_globalEnabled() && LG_prefBool(@"ContextMenu.Enabled", YES); }
@@ -89,6 +90,94 @@ static BOOL shouldRoundContextMenuSubview(UIView *view) {
     if (size.width < 20.0 || size.height < 20.0) return NO;
     if (size.width <= 2.0 || size.height <= 2.0) return NO;
     return YES;
+}
+
+static BOOL shouldHideContextMenuSeparatorView(UIView *view) {
+    if (!view || [view isKindOfClass:[LiquidGlassView class]]) return NO;
+    if (view.tag == kContextMenuTintTag || view.tag == kContextMenuGlassTag || view.tag == kContextMenuDividerTag) return NO;
+    if ([view isKindOfClass:[UIVisualEffectView class]]) return NO;
+
+    NSString *clsName = NSStringFromClass(view.class);
+    if ([clsName isEqualToString:@"_UIContextMenuReusableSeparatorView"]) return YES;
+    if ([clsName containsString:@"Separator"]) {
+        return YES;
+    }
+
+    CGSize size = view.bounds.size;
+    BOOL thinHorizontal = size.height > 0.0 && size.height <= 2.0 && size.width >= 24.0;
+    BOOL thinVertical = size.width > 0.0 && size.width <= 2.0 && size.height >= 24.0;
+    if (thinHorizontal || thinVertical) {
+        if (view.backgroundColor || view.layer.backgroundColor) return YES;
+    }
+    return NO;
+}
+
+static BOOL isContextMenuReusableGapView(UIView *view) {
+    if (!view) return NO;
+    return [NSStringFromClass(view.class) isEqualToString:@"UICollectionReusableView"];
+}
+
+static UIColor *contextMenuDividerColorForView(UIView *view) {
+    if (@available(iOS 12.0, *)) {
+        UITraitCollection *traits = view.traitCollection ?: UIScreen.mainScreen.traitCollection;
+        if (traits.userInterfaceStyle == UIUserInterfaceStyleDark)
+            return [UIColor colorWithWhite:1.0 alpha:0.16];
+    }
+    return [UIColor colorWithWhite:0.0 alpha:0.10];
+}
+
+static void styleContextMenuReusableGapView(UIView *view) {
+    if (!view) return;
+    view.hidden = NO;
+    view.alpha = 1.0;
+    view.backgroundColor = UIColor.clearColor;
+
+    UIView *divider = [view viewWithTag:kContextMenuDividerTag];
+    if (!divider) {
+        divider = [[UIView alloc] initWithFrame:CGRectZero];
+        divider.tag = kContextMenuDividerTag;
+        divider.userInteractionEnabled = NO;
+        [view addSubview:divider];
+    }
+
+    CGFloat inset = MAX(18.0, LGContextMenuRowInset());
+    CGFloat lineHeight = 2.0;
+    CGFloat width = MAX(0.0, view.bounds.size.width - inset * 2.0);
+    CGFloat y = round((view.bounds.size.height - lineHeight) * 0.5);
+    divider.frame = CGRectMake(inset, y, width, lineHeight);
+    divider.backgroundColor = contextMenuDividerColorForView(view);
+    divider.layer.cornerRadius = lineHeight * 0.5;
+    divider.layer.masksToBounds = YES;
+
+    for (UIView *inner in view.subviews) {
+        if (inner == divider) continue;
+        inner.hidden = YES;
+        inner.alpha = 0.0;
+    }
+}
+
+static BOOL LGIsContextMenuCollectionView(UICollectionView *collectionView) {
+    if (!collectionView) return NO;
+    static Class menuListCls;
+    if (!menuListCls) menuListCls = NSClassFromString(@"_UIContextMenuListView");
+    UIView *view = collectionView;
+    while (view) {
+        if (menuListCls && [view isKindOfClass:menuListCls]) return YES;
+        view = view.superview;
+    }
+    return NO;
+}
+
+static void hideContextMenuSeparators(UIView *root) {
+    for (UIView *sub in root.subviews) {
+        if (shouldHideContextMenuSeparatorView(sub)) {
+            sub.hidden = YES;
+            sub.alpha = 0.0;
+        } else if (isContextMenuReusableGapView(sub)) {
+            styleContextMenuReusableGapView(sub);
+        }
+        hideContextMenuSeparators(sub);
+    }
 }
 
 static UIColor *contextMenuTintColorForView(UIView *view) {
@@ -285,6 +374,45 @@ static void LGContextMenuPrefsChanged(CFNotificationCenterRef center,
 
 %end
 
+%hook UICollectionReusableView
+
+- (void)didMoveToWindow {
+    %orig;
+    UIView *self_ = (UIView *)self;
+    static Class menuListCls;
+    if (!menuListCls) menuListCls = NSClassFromString(@"_UIContextMenuListView");
+    if (!isContextMenuReusableGapView(self_)) return;
+    if (![self_ isDescendantOfView:(UIView *)self_.superview] && !hasAncestorClass(self_, menuListCls)) return;
+    if (!hasAncestorClass(self_, menuListCls)) return;
+    styleContextMenuReusableGapView(self_);
+}
+
+- (void)layoutSubviews {
+    %orig;
+    UIView *self_ = (UIView *)self;
+    static Class menuListCls;
+    if (!menuListCls) menuListCls = NSClassFromString(@"_UIContextMenuListView");
+    if (!isContextMenuReusableGapView(self_)) return;
+    if (!hasAncestorClass(self_, menuListCls)) return;
+    styleContextMenuReusableGapView(self_);
+}
+
+- (id)preferredLayoutAttributesFittingAttributes:(id)attributes {
+    return %orig;
+}
+
+%end
+
+%hook UICollectionView
+
+- (void)layoutSubviews {
+    %orig;
+    if (!LGIsContextMenuCollectionView(self)) return;
+    hideContextMenuSeparators(self);
+}
+
+%end
+
 %ctor {
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL,
@@ -350,6 +478,10 @@ static void LGContextMenuPrefsChanged(CFNotificationCenterRef center,
         if (@available(iOS 13.0, *))
             subview.layer.cornerCurve = kCACornerCurveContinuous;
     }
+    if ([self isKindOfClass:menuListCls] || hasAncestorClass(self, menuListCls)) {
+        hideContextMenuSeparators(self);
+        if (subview != self) hideContextMenuSeparators(subview);
+    }
 }
 
 - (void)layoutSubviews {
@@ -366,6 +498,7 @@ static void LGContextMenuPrefsChanged(CFNotificationCenterRef center,
     if (!shouldRoundContextMenuSubview(self)) return;
     if (self.layer.cornerRadius == LGContextMenuCornerRadius()) return;
     if (!hasAncestorClass(self, menuListCls)) return;
+    hideContextMenuSeparators(self);
     self.layer.cornerRadius = LGContextMenuCornerRadius();
     if (@available(iOS 13.0, *))
         self.layer.cornerCurve = kCACornerCurveContinuous;

@@ -35,6 +35,14 @@ static void *kLGControlTitleKey = &kLGControlTitleKey;
 static void *kLGControlSubtitleKey = &kLGControlSubtitleKey;
 static void *kLGControlledByEnabledKey = &kLGControlledByEnabledKey;
 
+static Class LGPrefsSwitchClass(void) {
+    return NSClassFromString(@"LGPrefsLiquidSwitch") ?: [UISwitch class];
+}
+
+static Class LGPrefsSliderClass(void) {
+    return NSClassFromString(@"LGPrefsLiquidSlider") ?: [UISlider class];
+}
+
 static NSUserDefaults *LGStandardDefaults(void) {
     return [NSUserDefaults standardUserDefaults];
 }
@@ -617,6 +625,7 @@ static UIBarButtonItem *LGMakeCircularBackItem(id target, SEL action) {
 static NSArray<NSDictionary *> *LGAllSurfaceItems(void);
 static void LGPresentResetConfirmation(UIViewController *controller);
 static void LGPresentRespringConfirmation(UIViewController *controller);
+static void LGPresentReopenSettingsConfirmation(UIViewController *controller);
 static void LGPresentInfoSheet(UIViewController *controller, NSString *title, NSString *message);
 
 static void LGResetAllPreferences(void) {
@@ -825,6 +834,15 @@ static NSArray<NSDictionary *> *LGAllSurfaceItems(void) {
         items = [all copy];
     });
     return items;
+}
+
+static NSArray<NSDictionary *> *LGMoreOptionsItems(void) {
+    return @[
+        LGSwitchSetting(@"SettingsControls.Enabled",
+                        LGLocalized(@"prefs.misc.settings_controls.title"),
+                        LGLocalized(@"prefs.misc.settings_controls.subtitle"),
+                        NO),
+    ];
 }
 
 static void LGDismissResetConfirmation(UIView *overlay, UIView *panel) {
@@ -1048,6 +1066,118 @@ static void LGPresentRespringConfirmation(UIViewController *controller) {
         LGSetNeedsRespring(NO);
         notify_post(kLGPrefsRespringNotification);
         LGDismissResetConfirmation(overlay, panel);
+    }] forControlEvents:UIControlEventTouchUpInside];
+
+    [controller.view addSubview:overlay];
+    [UIView animateWithDuration:0.22 animations:^{
+        overlay.alpha = 1.0;
+        panel.transform = CGAffineTransformIdentity;
+    }];
+}
+
+static void LGPresentReopenSettingsConfirmation(UIViewController *controller) {
+    if (!controller.view.window) return;
+    UIView *existing = [controller.view viewWithTag:0x1AD2];
+    if (existing) [existing removeFromSuperview];
+
+    UIView *overlay = [[UIView alloc] initWithFrame:controller.view.bounds];
+    overlay.tag = 0x1AD2;
+    overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    overlay.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.24];
+    overlay.alpha = 0.0;
+
+    UIControl *dismissControl = [[UIControl alloc] initWithFrame:overlay.bounds];
+    dismissControl.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [overlay addSubview:dismissControl];
+
+    UIVisualEffectView *panel =
+        [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
+    panel.translatesAutoresizingMaskIntoConstraints = NO;
+    panel.layer.cornerRadius = 32.0;
+    panel.layer.cornerCurve = kCACornerCurveContinuous;
+    panel.layer.masksToBounds = YES;
+    panel.transform = CGAffineTransformMakeScale(0.96, 0.96);
+
+    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    titleLabel.text = LGLocalized(@"prefs.reopen_settings.title");
+    titleLabel.font = [UIFont systemFontOfSize:24.0 weight:UIFontWeightBold];
+    titleLabel.numberOfLines = 0;
+
+    UILabel *bodyLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    bodyLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    bodyLabel.text = LGLocalized(@"prefs.reopen_settings.body");
+    bodyLabel.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightMedium];
+    bodyLabel.textColor = [UIColor secondaryLabelColor];
+    bodyLabel.numberOfLines = 0;
+
+    UIButton *laterButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    laterButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [laterButton setTitle:LGLocalized(@"prefs.button.later") forState:UIControlStateNormal];
+    [laterButton setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
+    laterButton.titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
+    laterButton.backgroundColor = [UIColor tertiarySystemFillColor];
+    laterButton.layer.cornerRadius = 23.0;
+    laterButton.layer.cornerCurve = kCACornerCurveContinuous;
+    laterButton.layer.masksToBounds = YES;
+
+    UIButton *reopenButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    reopenButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [reopenButton setTitle:LGLocalized(@"prefs.button.reopen_settings") forState:UIControlStateNormal];
+    [reopenButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    reopenButton.titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
+    reopenButton.backgroundColor = [UIColor systemBlueColor];
+    reopenButton.layer.cornerRadius = 23.0;
+    reopenButton.layer.cornerCurve = kCACornerCurveContinuous;
+    reopenButton.layer.masksToBounds = YES;
+
+    UIStackView *buttonRow = [[UIStackView alloc] initWithArrangedSubviews:@[laterButton, reopenButton]];
+    buttonRow.translatesAutoresizingMaskIntoConstraints = NO;
+    buttonRow.axis = UILayoutConstraintAxisHorizontal;
+    buttonRow.spacing = 12.0;
+    buttonRow.distribution = UIStackViewDistributionFillEqually;
+
+    [overlay addSubview:panel];
+    [panel.contentView addSubview:titleLabel];
+    [panel.contentView addSubview:bodyLabel];
+    [panel.contentView addSubview:buttonRow];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [panel.centerXAnchor constraintEqualToAnchor:overlay.centerXAnchor],
+        [panel.centerYAnchor constraintEqualToAnchor:overlay.centerYAnchor],
+        [panel.leadingAnchor constraintGreaterThanOrEqualToAnchor:overlay.leadingAnchor constant:20.0],
+        [panel.trailingAnchor constraintLessThanOrEqualToAnchor:overlay.trailingAnchor constant:-20.0],
+        [panel.widthAnchor constraintEqualToConstant:320.0],
+
+        [titleLabel.topAnchor constraintEqualToAnchor:panel.contentView.topAnchor constant:22.0],
+        [titleLabel.leadingAnchor constraintEqualToAnchor:panel.contentView.leadingAnchor constant:18.0],
+        [titleLabel.trailingAnchor constraintEqualToAnchor:panel.contentView.trailingAnchor constant:-18.0],
+
+        [bodyLabel.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:10.0],
+        [bodyLabel.leadingAnchor constraintEqualToAnchor:panel.contentView.leadingAnchor constant:18.0],
+        [bodyLabel.trailingAnchor constraintEqualToAnchor:panel.contentView.trailingAnchor constant:-18.0],
+
+        [buttonRow.topAnchor constraintEqualToAnchor:bodyLabel.bottomAnchor constant:20.0],
+        [buttonRow.leadingAnchor constraintEqualToAnchor:panel.contentView.leadingAnchor constant:16.0],
+        [buttonRow.trailingAnchor constraintEqualToAnchor:panel.contentView.trailingAnchor constant:-16.0],
+        [buttonRow.bottomAnchor constraintEqualToAnchor:panel.contentView.bottomAnchor constant:-16.0],
+        [laterButton.heightAnchor constraintEqualToConstant:46.0],
+        [reopenButton.heightAnchor constraintEqualToConstant:46.0],
+    ]];
+
+    [dismissControl addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull _) {
+        LGDismissResetConfirmation(overlay, panel);
+    }] forControlEvents:UIControlEventTouchUpInside];
+
+    [laterButton addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull _) {
+        LGDismissResetConfirmation(overlay, panel);
+    }] forControlEvents:UIControlEventTouchUpInside];
+
+    [reopenButton addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull _) {
+        LGDismissResetConfirmation(overlay, panel);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            exit(0);
+        });
     }] forControlEvents:UIControlEventTouchUpInside];
 
     [controller.view addSubview:overlay];
@@ -1917,15 +2047,20 @@ static UIView *LGMakeRespringBar(id target, SEL respringAction, SEL laterAction)
 }
 
 - (UISwitch *)configuredToggleForItem:(NSDictionary *)item {
-    UISwitch *toggle = [[LGPrefsLiquidSwitch alloc] initWithFrame:CGRectZero];
+    UISwitch *toggle = [[LGPrefsSwitchClass() alloc] initWithFrame:CGRectZero];
     toggle.onTintColor = _accentColor;
     toggle.on = [LGReadPreference(item[@"key"], item[@"default"]) boolValue];
     objc_setAssociatedObject(toggle, kLGDefaultValueKey, item[@"default"], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(toggle, kLGPreferenceKeyKey, item[@"key"], OBJC_ASSOCIATION_COPY_NONATOMIC);
     [toggle addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
         UISwitch *sender = (UISwitch *)action.sender;
-        LGWritePreferenceAndMaybeRequireRespring(item[@"key"], @(sender.isOn));
-        [self handleRespringStateChanged:nil];
+        if ([item[@"key"] isEqualToString:@"SettingsControls.Enabled"]) {
+            LGWritePreference(item[@"key"], @(sender.isOn));
+            LGPresentReopenSettingsConfirmation(self);
+        } else {
+            LGWritePreferenceAndMaybeRequireRespring(item[@"key"], @(sender.isOn));
+            [self handleRespringStateChanged:nil];
+        }
         if ([item[@"key"] hasSuffix:@".Enabled"]) {
             [self updatePanelsControlledByEnabledKey:item[@"key"] enabled:sender.isOn animated:YES];
         }
@@ -2016,7 +2151,7 @@ static UIView *LGMakeRespringBar(id target, SEL respringAction, SEL laterAction)
     NSInteger decimals = [item[@"decimals"] integerValue];
     NSString *subtitle = item[@"subtitle"];
 
-    UISlider *slider = [[LGPrefsLiquidSlider alloc] initWithFrame:CGRectZero];
+    UISlider *slider = [[LGPrefsSliderClass() alloc] initWithFrame:CGRectZero];
     slider.minimumValue = minValue;
     slider.maximumValue = maxValue;
     slider.value = [stored doubleValue];
@@ -2335,7 +2470,7 @@ static UIView *LGMakeRespringBar(id target, SEL respringAction, SEL laterAction)
     subtitleLabel.textColor = [UIColor secondaryLabelColor];
     subtitleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular];
 
-    UISwitch *toggle = [[LGPrefsLiquidSwitch alloc] initWithFrame:CGRectZero];
+    UISwitch *toggle = [[LGPrefsSwitchClass() alloc] initWithFrame:CGRectZero];
     toggle.onTintColor = [UIColor systemBlueColor];
     toggle.on = [self isGlobalEnabled];
     self.lg_globalToggle = toggle;
@@ -2572,7 +2707,7 @@ static UIView *LGMakeRespringBar(id target, SEL respringAction, SEL laterAction)
     [self pushSurfaceTitle:LGLocalized(@"prefs.misc.about.title")
                   subtitle:LGLocalized(@"prefs.misc.about.subtitle")
                      color:[UIColor systemGrayColor]
-                     items:@[]];
+                     items:LGMoreOptionsItems()];
 }
 
 - (void)handleResetPressed {

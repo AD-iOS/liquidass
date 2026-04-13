@@ -29,6 +29,17 @@ static BOOL isInsidePlatterView(UIView *view) {
     return NO;
 }
 
+static BOOL isInsideSwitcherSuggestionBanner(UIView *view) {
+    static Class cls;
+    if (!cls) cls = NSClassFromString(@"SBSwitcherAppSuggestionBannerView");
+    UIView *v = view;
+    while (v) {
+        if ([v isKindOfClass:cls]) return YES;
+        v = v.superview;
+    }
+    return NO;
+}
+
 static BOOL hasMaterialAncestorBeforeClass(UIView *view, Class stopClass) {
     static Class materialCls;
     if (!materialCls) materialCls = NSClassFromString(@"MTMaterialView");
@@ -44,6 +55,7 @@ static BOOL hasMaterialAncestorBeforeClass(UIView *view, Class stopClass) {
 static BOOL isPrimaryPlatterMaterialHost(UIView *view) {
     static Class platterCls;
     if (!platterCls) platterCls = NSClassFromString(@"PLPlatterView");
+    if (isInsideSwitcherSuggestionBanner(view)) return NO;
     if (!isInsidePlatterView(view)) return NO;
     return !hasMaterialAncestorBeforeClass(view, platterCls);
 }
@@ -70,6 +82,7 @@ static BOOL isPrimaryActionButtonMaterialHost(UIView *view) {
             ? @"PLPlatterActionButton"
             : @"NCNotificationListCellActionButton");
     }
+    if (isInsideSwitcherSuggestionBanner(view)) return NO;
     if (!isInsideActionButton(view)) return NO;
     return !hasMaterialAncestorBeforeClass(view, actionCls);
 }

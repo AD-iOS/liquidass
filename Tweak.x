@@ -1,8 +1,17 @@
 #import "LiquidGlass.h"
 #import <dlfcn.h>
 #import <objc/runtime.h>
+#import <fcntl.h>
+#import <unistd.h>
 #import <CoreVideo/CoreVideo.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import "Shared/LGMetalShaderSource.h"
+
+#ifndef LG_DEBUG_VERBOSE
+#define LG_DEBUG_VERBOSE 0
+#endif
+
+static BOOL LG_isAtLeastiOS16(void);
 
 static NSString *LGLogFilePath(void) {
     static NSString *sPath = nil;
@@ -53,6 +62,18 @@ void LGLog(NSString *format, ...) {
     LGAppendLogLine([NSString stringWithFormat:@"[LiquidAss] %@\n", message]);
 }
 
+static inline void LGDebugLog(NSString *format, ...) {
+#if LG_DEBUG_VERBOSE
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    LGLog(@"%@", message);
+#else
+    (void)format;
+#endif
+}
+
 typedef NS_OPTIONS(NSUInteger, SBSRelaunchActionOptions) {
     SBSRelaunchActionOptionsNone = 0,
     SBSRelaunchActionOptionsRestartRenderServer = 1 << 0,
@@ -73,213 +94,6 @@ typedef NS_OPTIONS(NSUInteger, SBSRelaunchActionOptions) {
 - (BOOL)drawHierarchyInRect:(CGRect)rect afterScreenUpdates:(BOOL)afterUpdates;
 @end
 
-static NSString * const kMetalSource = @"// fullscreen quad + glass shading\n"
-    "// kept as a string so the tweak can compile it at runtime\n"
-    "\n"
-    "#include <metal_stdlib>\n"
-    "using namespace metal;\n"
-    "\n"
-    "struct Uniforms {\n"
-    "    float2 resolution;\n"
-    "    float2 screenResolution;\n"
-    "    float2 cardOrigin;\n"
-    "    float2 wallpaperResolution;\n"
-    "    float  radius;\n"
-    "    float  bezelWidth;\n"
-    "    float  glassThickness;\n"
-    "    float  refractionScale;\n"
-    "    float  refractiveIndex;\n"
-    "    float  specularOpacity;\n"
-    "    float  specularAngle;\n"
-    "    float  blur;\n"
-    "    float2 wallpaperOrigin;\n"
-    "};\n"
-    "\n"
-    "\n"
-    "kernel void blurH(texture2d<float, access::read>  src    [[texture(0)]],\n"
-    "                  texture2d<float, access::write> dst    [[texture(1)]],\n"
-    "                  constant float&                 radius [[buffer(0)]],\n"
-    "                  uint2 gid [[thread_position_in_grid]]) {\n"
-    "    uint W = src.get_width(), H = src.get_height();\n"
-    "    if (gid.x >= W || gid.y >= H) return;\n"
-    "    // skip the blur pass if radius is basically off\n"
-    "    if (radius < 0.5) { dst.write(src.read(gid), gid); return; }\n"
-    "\n"
-    "    // wider blur means a wider gaussian sample window\n"
-    "    float sigma = max(radius / 2.0, 0.1);\n"
-    "    int   r     = min(int(ceil(radius * 2.0)), 60);\n"
-    "    float4 acc  = float4(0.0);\n"
-    "    float  wsum = 0.0;\n"
-    "    for (int x = -r; x <= r; x++) {\n"
-    "        int sx = clamp(int(gid.x) + x, 0, int(W) - 1);\n"
-    "        float w = exp(-float(x * x) / (2.0 * sigma * sigma));\n"
-    "        acc  += src.read(uint2(sx, gid.y)) * w;\n"
-    "        wsum += w;\n"
-    "    }\n"
-    "    dst.write(acc / wsum, gid);\n"
-    "}\n"
-    "\n"
-    "kernel void blurV(texture2d<float, access::read>  src    [[texture(0)]],\n"
-    "                  texture2d<float, access::write> dst    [[texture(1)]],\n"
-    "                  constant float&                 radius [[buffer(0)]],\n"
-    "                  uint2 gid [[thread_position_in_grid]]) {\n"
-    "    uint W = src.get_width(), H = src.get_height();\n"
-    "    if (gid.x >= W || gid.y >= H) return;\n"
-    "    // same as blurH, just on y\n"
-    "    if (radius < 0.5) { dst.write(src.read(gid), gid); return; }\n"
-    "\n"
-    "    float sigma = max(radius / 2.0, 0.1);\n"
-    "    int   r     = min(int(ceil(radius * 2.0)), 60);\n"
-    "    float4 acc  = float4(0.0);\n"
-    "    float  wsum = 0.0;\n"
-    "    for (int y = -r; y <= r; y++) {\n"
-    "        int sy = clamp(int(gid.y) + y, 0, int(H) - 1);\n"
-    "        float w = exp(-float(y * y) / (2.0 * sigma * sigma));\n"
-    "        acc  += src.read(uint2(gid.x, sy)) * w;\n"
-    "        wsum += w;\n"
-    "    }\n"
-    "    dst.write(acc / wsum, gid);\n"
-    "}\n"
-    "\n"
-    "float surfaceConvexSquircle(float x) {\n"
-    "    return pow(1.0 - pow(1.0 - x, 4.0), 0.25);\n"
-    "}\n"
-    "\n"
-    "float2 refractRay(float2 normal, float eta) {\n"
-    "    float cosI = -normal.y;\n"
-    "    float k    = 1.0 - eta * eta * (1.0 - cosI * cosI);\n"
-    "    if (k < 0.0) return float2(0.0);\n"
-    "    float kSqrt = sqrt(k);\n"
-    "    return float2(\n"
-    "        -(eta * cosI + kSqrt) * normal.x,\n"
-    "         eta - (eta * cosI + kSqrt) * normal.y\n"
-    "    );\n"
-    "}\n"
-    "\n"
-    "float rawRefraction(float bezelRatio, float glassThickness, float bezelWidth, float eta) {\n"
-    "    float x     = clamp(bezelRatio, 0.05, 0.95);\n"
-    "    float y     = surfaceConvexSquircle(x);\n"
-    "    // tiny offset to estimate the curve slope\n"
-    "    float y2    = surfaceConvexSquircle(x + 0.001);\n"
-    "    float deriv = (y2 - y) / 0.001;\n"
-    "    float mag   = sqrt(deriv * deriv + 1.0);\n"
-    "    // normal of the fake glass edge\n"
-    "    float2 n    = float2(-deriv / mag, -1.0 / mag);\n"
-    "    float2 r    = refractRay(n, eta);\n"
-    "    if (length(r) < 0.0001 || abs(r.y) < 0.0001) return 0.0;\n"
-    "    // project the refracted ray through the remaining edge depth\n"
-    "    float remaining = y * bezelWidth + glassThickness;\n"
-    "    return r.x * (remaining / r.y);\n"
-    "}\n"
-    "\n"
-    "float displacementAtRatio(float bezelRatio, float glassThickness,\n"
-    "                          float bezelWidth, float eta) {\n"
-    "    float peak = rawRefraction(0.05, glassThickness, bezelWidth, eta);\n"
-    "    if (abs(peak) < 0.0001) return 0.0;\n"
-    "    float raw     = rawRefraction(bezelRatio, glassThickness, bezelWidth, eta);\n"
-    "    float norm    = raw / peak;\n"
-    "    float falloff = 1.0 - smoothstep(0.0, 1.0, bezelRatio);\n"
-    "    return norm * falloff;\n"
-    "}\n"
-    "\n"
-    "struct VertexOut {\n"
-    "    float4 position [[position]];\n"
-    "    float2 localUV;\n"
-    "};\n"
-    "\n"
-    "vertex VertexOut vertexShader(uint vid [[vertex_id]]) {\n"
-    "    // 2 triangles that cover the whole card\n"
-    "    float2 pos[6] = {\n"
-    "        float2(-1,-1), float2(1,-1), float2(-1,1),\n"
-    "        float2(-1, 1), float2(1,-1), float2(1, 1)\n"
-    "    };\n"
-    "    float2 uv[6] = {\n"
-    "        float2(0,1), float2(1,1), float2(0,0),\n"
-    "        float2(0,0), float2(1,1), float2(1,0)\n"
-    "    };\n"
-    "    VertexOut out;\n"
-    "    out.position = float4(pos[vid], 0, 1);\n"
-    "    out.localUV  = uv[vid];\n"
-    "    return out;\n"
-    "}\n"
-    "\n"
-    "fragment float4 fragmentShader(VertexOut              in          [[stage_in]],\n"
-    "                               texture2d<float>       blurredTex  [[texture(0)]],\n"
-    "                               constant Uniforms&     u           [[buffer(0)]]) {\n"
-    "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
-    "\n"
-    "    float2 px = in.localUV * u.resolution;\n"
-    "    float W = u.resolution.x, H = u.resolution.y;\n"
-    "    float R = u.radius, bezel = u.bezelWidth;\n"
-    "    float eta = 1.0 / u.refractiveIndex;\n"
-    "\n"
-    "    // find whether this pixel lives in one of the rounded corners\n"
-    "    bool inLeft   = px.x < R,      inRight  = px.x > W - R;\n"
-    "    bool inTop    = px.y < R,      inBottom = px.y > H - R;\n"
-    "    bool inCorner = (inLeft || inRight) && (inTop || inBottom);\n"
-    "\n"
-    "    float cx = inLeft ? px.x - R : inRight  ? px.x - (W - R) : 0.0;\n"
-    "    float cy = inTop  ? px.y - R : inBottom ? px.y - (H - R) : 0.0;\n"
-    "    float distFromCenter = length(float2(cx, cy));\n"
-    "\n"
-    "    // hard clip outside the rounded shape\n"
-    "    if (inCorner && distFromCenter > R + 1.0) discard_fragment();\n"
-    "\n"
-    "    float distFromSide;\n"
-    "    float2 dir;\n"
-    "    if (inCorner) {\n"
-    "        // corner distance is radial\n"
-    "        distFromSide = max(0.0, R - distFromCenter);\n"
-    "        dir = distFromCenter > 0.001 ? normalize(float2(cx, cy)) : float2(0);\n"
-    "    } else {\n"
-    "        // straight edges just use the closest side\n"
-    "        float dL = px.x, dR = W - px.x, dT = px.y, dB = H - px.y;\n"
-    "        float dMin = min(min(dL, dR), min(dT, dB));\n"
-    "        distFromSide = dMin;\n"
-    "        dir = float2(\n"
-    "            (dL < dR  && dL == dMin) ? -1.0 : (dR <= dL && dR == dMin) ?  1.0 : 0.0,\n"
-    "            (dT < dB  && dT == dMin) ? -1.0 : (dB <= dT && dB == dMin) ?  1.0 : 0.0\n"
-    "        );\n"
-    "    }\n"
-    "\n"
-    "    float edgeOpacity = inCorner ? clamp(1.0 - max(0.0, distFromCenter - R), 0.0, 1.0) : 1.0;\n"
-    "    float bezelRatio  = clamp(distFromSide / bezel, 0.0, 1.0);\n"
-    "\n"
-    "    // only bend pixels near the edge\n"
-    "    float normDisp = (distFromSide < bezel)\n"
-    "        ? displacementAtRatio(bezelRatio, u.glassThickness, bezel, eta)\n"
-    "        : 0.0;\n"
-    "    float2 dispPx = -dir * normDisp * bezel * u.refractionScale * edgeOpacity;\n"
-    "\n"
-    "    // move from local card space into screen space\n"
-    "    float2 screenPx = u.cardOrigin + px + dispPx;\n"
-    "\n"
-    "    float2 imgPx    = screenPx - u.wallpaperOrigin;\n"
-    "    // sample from the real wallpaper size even if the texture was downscaled\n"
-    "    float2 sampleUV = clamp(imgPx / u.wallpaperResolution, 0.0, 1.0);\n"
-    "\n"
-    "    float4 bgColor = blurredTex.sample(s, sampleUV);\n"
-    "\n"
-    "    // thin highlight around the edge\n"
-    "    float2 lightDir   = float2(cos(u.specularAngle), -sin(u.specularAngle));\n"
-    "    float  specDot    = dot(dir, lightDir);\n"
-    "    float  strokePx   = 1.5;\n"
-    "    float  strokeMask = clamp(1.0 - (distFromSide / strokePx), 0.0, 1.0);\n"
-    "\n"
-    "    float  lobeStart  = 0.66;\n"
-    "    float  lobeWidth  = 0.14;\n"
-    "    float  primary    = smoothstep(lobeStart, lobeStart + lobeWidth, specDot);\n"
-    "    float  secondary  = smoothstep(lobeStart, lobeStart + lobeWidth, -specDot);\n"
-    "    // corners need a broader match or the arc dies too fast\n"
-    "    float  cornerSpec = smoothstep(0.52, 0.88, abs(specDot));\n"
-    "    float  specLobe   = inCorner ? cornerSpec : (primary + secondary);\n"
-    "\n"
-    "    float  specular   = specLobe * strokeMask * u.specularOpacity * edgeOpacity;\n"
-    "    bgColor.rgb += specular;\n"
-    "\n"
-    "    return float4(bgColor.rgb, edgeOpacity);\n"
-    "}\n"
-    "";
 
 typedef struct {
     vector_float2 resolution;
@@ -295,6 +109,7 @@ typedef struct {
     float         specularAngle;
     float         blur;
     vector_float2 wallpaperOrigin;
+    float         samplingOrientation;
 } LGUniforms;
 
 UIView *LG_findSubviewOfClass(UIView *root, Class cls) {
@@ -419,28 +234,85 @@ static UIWindow *LG_getWallpaperWindow(BOOL secureOnly) {
     return secureOnly ? nil : secureFallback;
 }
 
-static UIImageView *LG_getWallpaperImageView(UIWindow *win) {
-    static Class replicaCls, staticWpCls, ivCls;
+static BOOL LG_viewMatchesHierarchyClass(UIView *view, Class cls) {
+    if (!view || !cls) return NO;
+    UIView *v = view;
+    while (v) {
+        if ([v isKindOfClass:cls]) return YES;
+        v = v.superview;
+    }
+    UIResponder *r = view;
+    while (r) {
+        if ([r isKindOfClass:cls]) return YES;
+        r = r.nextResponder;
+    }
+    return NO;
+}
+
+static UIImageView *LG_findImageViewInTree(UIView *root) {
+    if (!root) return nil;
+    if ([root isKindOfClass:[UIImageView class]] && ((UIImageView *)root).image)
+        return (UIImageView *)root;
+    for (UIView *sub in root.subviews) {
+        UIImageView *found = LG_findImageViewInTree(sub);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void LG_collectViewsOfClass(UIView *root, Class cls, NSMutableArray<UIView *> *results, NSInteger depth) {
+    if (!root || !cls || !results || depth > 96) return;
+    if ([root isKindOfClass:cls]) [results addObject:root];
+    for (UIView *sub in root.subviews)
+        LG_collectViewsOfClass(sub, cls, results, depth + 1);
+}
+
+static UIImageView *LG_getWallpaperImageView(UIWindow *win, BOOL lockscreen) {
+    static Class replicaCls, staticWpCls, homePosterVCCls, lockPosterVCCls;
     if (!replicaCls)  replicaCls  = NSClassFromString(@"PBUISnapshotReplicaView");
     if (!staticWpCls) staticWpCls = NSClassFromString(@"SBFStaticWallpaperImageView");
-    if (!ivCls)       ivCls       = [UIImageView class];
-    UIView *replica = LG_findSubviewOfClass(win, replicaCls);
-    if (replica) {
-        for (UIView *sub in replica.subviews)
-            if ([sub isKindOfClass:ivCls] && ((UIImageView *)sub).image) {
-                CGRect screenRect = [((UIImageView *)sub) convertRect:((UIImageView *)sub).bounds toView:nil];
-                LGLog(@"homescreen wallpaper imageView source=%@ rect=%@",
-                      NSStringFromClass(sub.class),
-                      NSStringFromCGRect(screenRect));
-                return (UIImageView *)sub;
+    if (!homePosterVCCls) homePosterVCCls = NSClassFromString(@"PBUIPosterHomeViewController");
+    if (!lockPosterVCCls) lockPosterVCCls = NSClassFromString(@"PBUIPosterLockViewController");
+
+    Class targetPosterVCCls = lockscreen ? lockPosterVCCls : homePosterVCCls;
+    NSMutableArray<UIView *> *replicas = [NSMutableArray array];
+    LG_collectViewsOfClass(win, replicaCls, replicas, 0);
+    for (UIView *replica in replicas) {
+        if (targetPosterVCCls && !LG_viewMatchesHierarchyClass(replica, targetPosterVCCls))
+            continue;
+        UIImageView *iv = LG_findImageViewInTree(replica);
+        if (iv.image) {
+            CGRect screenRect = [iv convertRect:iv.bounds toView:nil];
+            LGDebugLog(@"%@ wallpaper imageView source=%@ rect=%@ match=%@",
+                       lockscreen ? @"lockscreen" : @"homescreen",
+                       NSStringFromClass(iv.class),
+                       NSStringFromCGRect(screenRect),
+                       NSStringFromClass(targetPosterVCCls));
+            return iv;
+        }
+    }
+
+    if (!LG_isAtLeastiOS16()) {
+        UIView *replica = LG_findSubviewOfClass(win, replicaCls);
+        if (replica) {
+            UIImageView *iv = LG_findImageViewInTree(replica);
+            if (iv.image) {
+                CGRect screenRect = [iv convertRect:iv.bounds toView:nil];
+                LGDebugLog(@"%@ wallpaper imageView source=%@ rect=%@",
+                           lockscreen ? @"lockscreen" : @"homescreen",
+                           NSStringFromClass(iv.class),
+                           NSStringFromCGRect(screenRect));
+                return iv;
             }
+        }
     }
     UIImageView *iv = (UIImageView *)LG_findSubviewOfClass(win, staticWpCls);
     if (iv.image) {
         CGRect screenRect = [iv convertRect:iv.bounds toView:nil];
-        LGLog(@"homescreen wallpaper imageView source=%@ rect=%@",
-              NSStringFromClass(iv.class),
-              NSStringFromCGRect(screenRect));
+        LGDebugLog(@"%@ wallpaper imageView source=%@ rect=%@",
+                   lockscreen ? @"lockscreen" : @"homescreen",
+                   NSStringFromClass(iv.class),
+                   NSStringFromCGRect(screenRect));
         return iv;
     }
     return nil;
@@ -486,6 +358,26 @@ static CGPoint LG_getHomescreenWallpaperOriginForImage(UIImage *image) {
     return LG_centeredWallpaperOriginForImage(image);
 }
 
+static float LG_samplingOrientationForGlassView(UIView *view, LGUpdateGroup group) {
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) return 1.0f;
+    if (group == LGUpdateGroupLockscreen) return 1.0f;
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *scene = view.window.windowScene;
+        if (scene) return (float)scene.interfaceOrientation;
+    }
+    return 1.0f;
+}
+
+static UIImage *LG_normalizedImageForUpload(UIImage *image) {
+    if (!image) return nil;
+    if (image.imageOrientation == UIImageOrientationUp) return image;
+    UIGraphicsBeginImageContextWithOptions(image.size, NO, image.scale);
+    [image drawInRect:CGRectMake(0, 0, image.size.width, image.size.height)];
+    UIImage *normalized = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return normalized ?: image;
+}
+
 static UIImage *sCachedSnapshot = nil;
 static UIImage *sCachedContextMenuSnapshot = nil;
 static UIImage *sCachedFolderSnapshot = nil;
@@ -495,13 +387,28 @@ static NSDate *sCachedSpringBoardHomeMTime = nil;
 static NSDate *sCachedSpringBoardLockMTime = nil;
 static NSString *sCachedSpringBoardHomePath = nil;
 static NSString *sCachedSpringBoardLockPath = nil;
+static NSDate *sObservedLegacyHomeAssetMTime = nil;
+static NSDate *sObservedLegacyLockAssetMTime = nil;
+static NSString *sObservedLegacyHomeAssetPath = nil;
+static NSString *sObservedLegacyLockAssetPath = nil;
+static dispatch_source_t sLegacyWallpaperWatcher = nil;
+static int sLegacyWallpaperWatcherFD = -1;
+static BOOL sLegacyWallpaperRescanScheduled = NO;
+static NSUInteger sPendingHomescreenWallpaperRefreshToken = 0;
+static NSUInteger sPendingLockscreenWallpaperRefreshToken = 0;
+static BOOL sSnapshotRetryScheduled = NO;
 static NSString * const kLGPrefsDomain = @"dylv.liquidassprefs";
 static CFStringRef const kLGPrefsChangedNotification = CFSTR("dylv.liquidassprefs/Reload");
 static CFStringRef const kLGPrefsRespringNotification = CFSTR("dylv.liquidassprefs/Respring");
 static void LG_trySnapshotWithRetry(void);
+static void LG_scheduleHomescreenWallpaperRefresh(NSString *reason, UIImage *image);
+static void LG_scheduleLockscreenWallpaperRefresh(NSString *reason);
 static void LG_handlePrefsChanged(void);
 static void LG_requestRespring(void);
 static CGColorSpaceRef LGSharedRGBColorSpace(void);
+static void LG_startLegacyWallpaperWatcher(void);
+static void LGScheduleBlockAfterDelay(NSTimeInterval delay, dispatch_block_t block);
+static void LG_clearTextureCache(void);
 
 static BOOL LG_isAtLeastiOS16(void) {
     static BOOL sCachedResult = NO;
@@ -566,6 +473,90 @@ static NSString *LG_preferredSpringBoardWallpaperPath(BOOL lockscreen) {
         if ([fm fileExistsAtPath:path]) return path;
     }
     return nil;
+}
+
+static BOOL LG_equalMaybeNilObjects(id a, id b) {
+    if (a == b) return YES;
+    if (!a || !b) return NO;
+    return [a isEqual:b];
+}
+
+static BOOL LG_noteLegacyWallpaperAssetChange(BOOL lockscreen) {
+    if (LG_isAtLeastiOS16()) return NO;
+
+    NSString *path = LG_preferredSpringBoardWallpaperPath(lockscreen);
+    NSDate *mtime = nil;
+    if (path.length) {
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        mtime = attrs[NSFileModificationDate];
+    }
+
+    NSDate * __strong *observedMTime = lockscreen ? &sObservedLegacyLockAssetMTime : &sObservedLegacyHomeAssetMTime;
+    NSString * __strong *observedPath = lockscreen ? &sObservedLegacyLockAssetPath : &sObservedLegacyHomeAssetPath;
+
+    BOOL hadBaseline = (*observedPath != nil) || (*observedMTime != nil);
+    BOOL changed = hadBaseline &&
+        (!LG_equalMaybeNilObjects(*observedPath, path) || !LG_equalMaybeNilObjects(*observedMTime, mtime));
+
+    *observedPath = [path copy];
+    *observedMTime = mtime;
+    return changed;
+}
+
+static void LG_checkLegacyWallpaperAssetChanges(void) {
+    if (!LG_globalEnabled()) return;
+    if (LG_isAtLeastiOS16()) return;
+
+    BOOL homeChanged = LG_noteLegacyWallpaperAssetChange(NO);
+    BOOL lockChanged = LG_noteLegacyWallpaperAssetChange(YES);
+
+    if (homeChanged)
+        LG_scheduleHomescreenWallpaperRefresh(@"legacy-home-asset", nil);
+    if (lockChanged)
+        LG_scheduleLockscreenWallpaperRefresh(@"legacy-lock-asset");
+}
+
+static void LG_startLegacyWallpaperWatcher(void) {
+    if (LG_isAtLeastiOS16()) return;
+    if (sLegacyWallpaperWatcher) return;
+    NSString *dir = LG_springBoardWallpaperDirectory();
+    if (!dir.length) return;
+
+    sLegacyWallpaperWatcherFD = open(dir.fileSystemRepresentation, O_EVTONLY);
+    if (sLegacyWallpaperWatcherFD < 0) return;
+
+    dispatch_queue_t queue = dispatch_get_main_queue();
+    unsigned long mask = DISPATCH_VNODE_WRITE | DISPATCH_VNODE_DELETE | DISPATCH_VNODE_EXTEND |
+                         DISPATCH_VNODE_ATTRIB | DISPATCH_VNODE_LINK | DISPATCH_VNODE_RENAME |
+                         DISPATCH_VNODE_REVOKE;
+    sLegacyWallpaperWatcher = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE,
+                                                     (uintptr_t)sLegacyWallpaperWatcherFD,
+                                                     mask,
+                                                     queue);
+    if (!sLegacyWallpaperWatcher) {
+        close(sLegacyWallpaperWatcherFD);
+        sLegacyWallpaperWatcherFD = -1;
+        return;
+    }
+
+    dispatch_source_set_event_handler(sLegacyWallpaperWatcher, ^{
+        if (sLegacyWallpaperRescanScheduled) return;
+        sLegacyWallpaperRescanScheduled = YES;
+        LGScheduleBlockAfterDelay(0.20, ^{
+            sLegacyWallpaperRescanScheduled = NO;
+            LG_checkLegacyWallpaperAssetChanges();
+        });
+    });
+    dispatch_source_set_cancel_handler(sLegacyWallpaperWatcher, ^{
+        if (sLegacyWallpaperWatcherFD >= 0) {
+            close(sLegacyWallpaperWatcherFD);
+            sLegacyWallpaperWatcherFD = -1;
+        }
+    });
+    dispatch_resume(sLegacyWallpaperWatcher);
+
+    // establish the baseline once the watcher is armed
+    LG_checkLegacyWallpaperAssetChanges();
 }
 
 BOOL LG_hasHomescreenWallpaperAsset(void) {
@@ -743,7 +734,7 @@ UIImage *LG_getWallpaperImage(CGPoint *outOriginInScreenPts) {
     }
     UIWindow *win = LG_getWallpaperWindow(NO);
     if (!win) return nil;
-    UIImageView *iv = LG_getWallpaperImageView(win);
+    UIImageView *iv = LG_getWallpaperImageView(win, NO);
     if (!iv.image) return nil;
     if (outOriginInScreenPts)
         *outOriginInScreenPts = [iv convertPoint:CGPointZero toView:nil];
@@ -876,7 +867,7 @@ static BOOL LG_drawHomescreenWallpaperInContext(CGSize screenSize) {
 
     UIWindow *win = LG_getWallpaperWindow(NO);
     if (!win) return NO;
-    UIImageView *iv = LG_getWallpaperImageView(win);
+    UIImageView *iv = LG_getWallpaperImageView(win, NO);
     if (iv.image) {
         [win drawViewHierarchyInRect:bounds afterScreenUpdates:NO];
         return YES;
@@ -897,7 +888,7 @@ static BOOL LG_drawLockscreenWallpaperInContext(CGSize screenSize) {
     CGRect bounds = CGRectMake(0, 0, screenSize.width, screenSize.height);
     UIWindow *win = LG_getWallpaperWindow(YES);
     if (!win) return NO;
-    UIImageView *iv = LG_getWallpaperImageView(win);
+    UIImageView *iv = LG_getWallpaperImageView(win, YES);
     if (LG_isAtLeastiOS16() && iv.image) {
         CGRect displayedRect = LG_imageViewDisplayedImageRect(iv);
         CGRect screenRect = [iv convertRect:displayedRect toView:nil];
@@ -916,10 +907,14 @@ void LG_refreshHomescreenSnapshot(void) {
     UIImage *asset = LG_loadSpringBoardWallpaperImage(NO);
     if (asset) {
         UIWindow *win = LG_getWallpaperWindow(NO);
-        UIImageView *iv = win ? LG_getWallpaperImageView(win) : nil;
-        LGLog(@"refresh homescreen snapshot source=asset file=%@ imageView=%d",
-              LG_preferredSpringBoardWallpaperPath(NO).lastPathComponent ?: @"(unknown)",
-              iv ? 1 : 0);
+        UIImageView *iv = win ? LG_getWallpaperImageView(win, NO) : nil;
+        LGDebugLog(@"refresh homescreen snapshot source=asset file=%@ imageView=%d screen=%@ image=%@ scale=%.2f orientation=%ld",
+                   LG_preferredSpringBoardWallpaperPath(NO).lastPathComponent ?: @"(unknown)",
+                   iv ? 1 : 0,
+                   NSStringFromCGSize(UIScreen.mainScreen.bounds.size),
+                   NSStringFromCGSize(asset.size),
+                   asset.scale,
+                   (long)asset.imageOrientation);
         sCachedSnapshot = asset;
         return;
     }
@@ -928,12 +923,16 @@ void LG_refreshHomescreenSnapshot(void) {
     CGFloat scale     = UIScreen.mainScreen.scale;
 
     UIGraphicsBeginImageContextWithOptions(screenSize, YES, scale);
-    LGLog(@"refresh homescreen snapshot source=live-window");
+    LGDebugLog(@"refresh homescreen snapshot source=live-window");
     BOOL ok = LG_drawHomescreenWallpaperInContext(screenSize);
     UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
 
     if (!ok || LG_imageLooksBlack(img)) return;
+    LGDebugLog(@"refresh homescreen snapshot live result image=%@ scale=%.2f orientation=%ld",
+               NSStringFromCGSize(img.size),
+               img.scale,
+               (long)img.imageOrientation);
     sCachedSnapshot = img;
 }
 
@@ -1019,6 +1018,30 @@ static UIViewController *LG_topPresentedViewController(UIViewController *control
 }
 
 static BOOL sTodayViewVisible = NO;
+
+static void LGResetHomescreenSnapshotCaches(void) {
+    sCachedSnapshot = nil;
+    sCachedContextMenuSnapshot = nil;
+    sCachedFolderSnapshot = nil;
+    sCachedSpringBoardHomeImage = nil;
+    sCachedSpringBoardHomeMTime = nil;
+    sCachedSpringBoardHomePath = nil;
+    LG_clearTextureCache();
+}
+
+static void LGScheduleBlockAfterDelay(NSTimeInterval delay, dispatch_block_t block) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(0.0, delay) * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(),
+                   block);
+}
+
+static void LGWarmTransientSnapshotsAfterDelay(NSTimeInterval delay) {
+    LGScheduleBlockAfterDelay(delay, ^{
+        if (!LG_globalEnabled()) return;
+        if (!LG_getFolderSnapshot()) LG_cacheFolderSnapshot();
+        if (!LG_getStrictCachedContextMenuSnapshot()) LG_cacheContextMenuSnapshot();
+    });
+}
 
 static BOOL LG_isTodayViewControllerVisible(void) {
     if (sTodayViewVisible) return YES;
@@ -1145,6 +1168,7 @@ static BOOL LG_contextSnapshotIsUsable(UIImage *snapshot) {
 
 static UIImage *LG_captureContextMenuSnapshotWithHiddenGlass(BOOL hideGlass) {
     if (!LG_globalEnabled()) return nil;
+    CFTimeInterval start = CACurrentMediaTime();
 
     CGSize screenSize = UIScreen.mainScreen.bounds.size;
     CGFloat scale     = UIScreen.mainScreen.scale;
@@ -1164,6 +1188,7 @@ static UIImage *LG_captureContextMenuSnapshotWithHiddenGlass(BOOL hideGlass) {
 
     UIImage *snap = nil;
     BOOL todayViewVisible = LG_isTodayViewControllerVisible();
+    NSString *mode = todayViewVisible ? @"today" : @"homescreen";
     if (todayViewVisible) {
         UIWindow *homescreenWindow = LG_getHomescreenWindow();
         if (homescreenWindow) {
@@ -1183,11 +1208,20 @@ static UIImage *LG_captureContextMenuSnapshotWithHiddenGlass(BOOL hideGlass) {
         for (UIWindow *window in renderWindows) {
             [windowNames addObject:NSStringFromClass(window.class)];
         }
+        LGDebugLog(@"snapshot capture fallback hideGlass=%d mode=%@ windows=%@", hideGlass, mode, windowNames);
         snap = LG_captureBroadContextComposite(renderWindows, screenSize, scale);
     }
 
     if (hideGlass || hiddenWindows.count > 0)
         LG_restoreSnapshotVisibility(hiddenViews, hiddenWindows);
+    CFTimeInterval elapsedMs = (CACurrentMediaTime() - start) * 1000.0;
+    LGDebugLog(@"snapshot capture done hideGlass=%d mode=%@ ok=%d usable=%d elapsed=%.1fms size=%@",
+               hideGlass,
+               mode,
+               snap ? 1 : 0,
+               LG_contextSnapshotIsUsable(snap) ? 1 : 0,
+               elapsedMs,
+               snap ? NSStringFromCGSize(snap.size) : @"(null)");
     return snap;
 }
 
@@ -1226,6 +1260,7 @@ UIImage *LG_getHomescreenSnapshot(CGPoint *outOriginInScreenPts) {
         if (outOriginInScreenPts) *outOriginInScreenPts = CGPointZero;
         return nil;
     }
+    if (!sCachedSnapshot) LG_refreshHomescreenSnapshot();
     UIImage *asset = LG_loadSpringBoardWallpaperImage(NO);
     if (asset && outOriginInScreenPts) {
         *outOriginInScreenPts = LG_isCPBitmapPath(LG_preferredSpringBoardWallpaperPath(NO))
@@ -1234,17 +1269,24 @@ UIImage *LG_getHomescreenSnapshot(CGPoint *outOriginInScreenPts) {
     } else if (outOriginInScreenPts) {
         *outOriginInScreenPts = CGPointZero;
     }
-    if (!sCachedSnapshot) LG_refreshHomescreenSnapshot();
     return sCachedSnapshot;
 }
 
 void LG_cacheFolderSnapshot(void) {
     if (!LG_globalEnabled()) return;
+    CFTimeInterval start = CACurrentMediaTime();
+    LGDebugLog(@"folder snapshot cache begin");
     UIImage *snapshot = LG_captureContextMenuSnapshotWithHiddenGlass(NO);
     sCachedFolderSnapshot = LG_contextSnapshotIsUsable(snapshot) ? snapshot : nil;
+    CFTimeInterval elapsedMs = (CACurrentMediaTime() - start) * 1000.0;
+    LGDebugLog(@"folder snapshot cache end success=%d elapsed=%.1fms size=%@",
+               sCachedFolderSnapshot ? 1 : 0,
+               elapsedMs,
+               sCachedFolderSnapshot ? NSStringFromCGSize(sCachedFolderSnapshot.size) : @"(null)");
 }
 
 void LG_invalidateFolderSnapshot(void) {
+    LGDebugLog(@"folder snapshot invalidated");
     sCachedFolderSnapshot = nil;
     LG_invalidateContextMenuSnapshot();
 }
@@ -1261,7 +1303,7 @@ UIImage *LG_getLockscreenSnapshot(void) {
         if (asset) return asset;
 
         UIWindow *win = LG_getWallpaperWindow(YES);
-        UIImageView *iv = win ? LG_getWallpaperImageView(win) : nil;
+        UIImageView *iv = win ? LG_getWallpaperImageView(win, YES) : nil;
         if (iv.image) {
             LGLog(@"loaded lockscreen wallpaper from imageView fallback");
             return iv.image;
@@ -1288,7 +1330,7 @@ CGPoint LG_getLockscreenWallpaperOrigin(void) {
         return LG_centeredWallpaperOriginForImage(asset);
     }
     UIWindow *win = LG_getWallpaperWindow(YES);
-    UIImageView *iv = win ? LG_getWallpaperImageView(win) : nil;
+    UIImageView *iv = win ? LG_getWallpaperImageView(win, YES) : nil;
     if (iv.image) {
         CGRect displayedRect = LG_imageViewDisplayedImageRect(iv);
         CGRect screenRect = [iv convertRect:displayedRect toView:nil];
@@ -1307,12 +1349,16 @@ static MTLComputePassDescriptor   *sComputePassDesc;
 
 @interface LGTextureCache : NSObject
 @property (nonatomic, strong) id<MTLTexture> bgTexture;
-@property (nonatomic, strong) id<MTLTexture> blurTmpTexture;
-@property (nonatomic, strong) id<MTLTexture> blurredTexture;
 @property (nonatomic, strong) id bridge;
-@property (nonatomic, assign) float          bakedBlurRadius;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, id> *blurVariants;
 @end
 @implementation LGTextureCache @end
+
+@interface LGBlurVariant : NSObject
+@property (nonatomic, strong) id<MTLTexture> texture;
+@property (nonatomic, assign) float bakedBlurRadius;
+@end
+@implementation LGBlurVariant @end
 
 @interface LGZeroCopyBridge : NSObject
 @property (nonatomic, strong) id<MTLDevice> device;
@@ -1428,9 +1474,18 @@ static MTLComputePassDescriptor   *sComputePassDesc;
 
 static NSMapTable *sTextureCache = nil;
 
+static void LG_clearTextureCache(void) {
+    sTextureCache = [NSMapTable weakToStrongObjectsMapTable];
+}
+
 static NSNumber *LGTextureScaleKey(CGFloat scale) {
     NSInteger milli = (NSInteger)lrint(scale * 1000.0);
     return @(MAX(milli, 1));
+}
+
+static NSNumber *LGBlurSettingKey(CGFloat blur) {
+    NSInteger milli = (NSInteger)lrint(fmax(0.0, blur) * 1000.0);
+    return @(MAX(milli, 0));
 }
 
 static LGTextureCache *LG_getCacheForImage(UIImage *image, CGFloat scale) {
@@ -1452,7 +1507,7 @@ static void LG_prewarmPipelines(void) {
     if (!sDevice) { return; }
 
     NSError *err = nil;
-    id<MTLLibrary> lib = [sDevice newLibraryWithSource:kMetalSource
+    id<MTLLibrary> lib = [sDevice newLibraryWithSource:LGGlassMetalSource()
                                                options:[MTLCompileOptions new]
                                                  error:&err];
     if (!lib) { return; }
@@ -1480,13 +1535,12 @@ static void LG_prewarmPipelines(void) {
     sBlurVPipeline = [sDevice newComputePipelineStateWithFunction:blurV error:&err];
     sSharedCommandQueue = [sDevice newCommandQueue];
     sComputePassDesc    = [MTLComputePassDescriptor computePassDescriptor];
-    sTextureCache       = [NSMapTable weakToStrongObjectsMapTable];
+    LG_clearTextureCache();
 }
 
 
 @implementation LiquidGlassView {
     id<MTLTexture> _bgTexture;
-    id<MTLTexture> _blurTmpTexture;
     id<MTLTexture> _blurredTexture;
     LGTextureCache *_cacheEntry;
     MTKView        *_mtkView;
@@ -1601,6 +1655,7 @@ static void LG_prewarmPipelines(void) {
     if (_wallpaperImage == img) return;
     _wallpaperImage = img;
     [self _reloadTexture];
+    [self scheduleDraw];
 }
 
 - (CGPoint)wallpaperOrigin {
@@ -1654,6 +1709,15 @@ static void LG_prewarmPipelines(void) {
                                        UIScreen.mainScreen.bounds.size.width * scale,
                                        UIScreen.mainScreen.bounds.size.height * scale);
     if (!CGRectIntersectsRect(_cachedVisualRectPx, screenBoundsPx)) return;
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad && metricsChanged) {
+        LGDebugLog(@"glass update group=%ld bounds=%@ visualPx=%@ screen=%@ origin=%@ wallpaper=%@",
+                   (long)_updateGroup,
+                   NSStringFromCGRect(self.bounds),
+                   NSStringFromCGRect(_cachedVisualRectPx),
+                   NSStringFromCGSize(UIScreen.mainScreen.bounds.size),
+                   NSStringFromCGPoint(_wallpaperOriginPt),
+                   self.wallpaperImage ? NSStringFromCGSize(self.wallpaperImage.size) : @"(null)");
+    }
     if (!metricsChanged && !_needsBlurBake) return;
     [self scheduleDraw];
 }
@@ -1687,7 +1751,18 @@ static void LG_prewarmPipelines(void) {
 - (BOOL)_refreshVisualMetrics {
     CGFloat scale = UIScreen.mainScreen.scale;
     CGRect visualRect;
-    if (_updateGroup == LGUpdateGroupLockscreen && self.window) {
+    BOOL useDirectScreenConversion = (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad &&
+                                      _updateGroup != LGUpdateGroupLockscreen &&
+                                      self.window != nil);
+    if (useDirectScreenConversion) {
+        CGRect screenRect = self.window.windowScene
+            ? [self convertRect:self.bounds toCoordinateSpace:UIScreen.mainScreen.coordinateSpace]
+            : [self convertRect:self.bounds toView:nil];
+        visualRect = CGRectMake(screenRect.origin.x * scale,
+                                screenRect.origin.y * scale,
+                                screenRect.size.width * scale,
+                                screenRect.size.height * scale);
+    } else if (self.window) {
         CALayer *pres = self.layer.presentationLayer ?: self.layer;
         CALayer *windowLayer = self.window.layer.presentationLayer ?: self.window.layer;
         CGRect windowScreenRect = self.window.windowScene
@@ -1718,7 +1793,6 @@ static void LG_prewarmPipelines(void) {
                                     screenRect.size.height * scale);
         }
     } else {
-        // use presentation layers so close animations stay anchored right
         CALayer *pres = self.layer.presentationLayer ?: self.layer;
         CALayer *root = pres;
         while (root.superlayer)
@@ -1798,20 +1872,20 @@ static void LG_prewarmPipelines(void) {
     CGFloat groupCap = 1.0;
     switch (_updateGroup) {
         case LGUpdateGroupAppIcons: groupCap = 0.28; break;
-        case LGUpdateGroupFolderIcon: groupCap = 0.35; break;
-        case LGUpdateGroupWidgets: groupCap = 0.40; break;
-        case LGUpdateGroupAppLibrary: groupCap = 0.35; break;
-        case LGUpdateGroupDock: groupCap = 0.50; break;
-        case LGUpdateGroupContextMenu: groupCap = 0.50; break;
-        case LGUpdateGroupFolderOpen: groupCap = 0.50; break;
-        case LGUpdateGroupLockscreen: groupCap = 0.75; break;
+        case LGUpdateGroupFolderIcon: groupCap = 0.28; break;
+        case LGUpdateGroupWidgets: groupCap = 0.34; break;
+        case LGUpdateGroupAppLibrary: groupCap = 0.30; break;
+        case LGUpdateGroupDock: groupCap = 0.42; break;
+        case LGUpdateGroupContextMenu: groupCap = 0.42; break;
+        case LGUpdateGroupFolderOpen: groupCap = 0.42; break;
+        case LGUpdateGroupLockscreen: groupCap = 0.65; break;
         default: break;
     }
     return fmin(fmin(userScale, adaptiveScale), groupCap);
 }
 
 - (void)_reloadTexture {
-    UIImage *image = self.wallpaperImage;
+    UIImage *image = LG_normalizedImageForUpload(self.wallpaperImage);
     if (!image) return;
     NSUInteger srcW = (NSUInteger)(image.size.width  * image.scale);
     NSUInteger srcH = (NSUInteger)(image.size.height * image.scale);
@@ -1825,14 +1899,13 @@ static void LG_prewarmPipelines(void) {
 
     LGTextureCache *cached = LG_getCacheForImage(image, textureScale);
     if (cached) {
-        // blur textures get reused per image + scale
-        _cacheEntry      = cached;
-        _bgTexture      = cached.bgTexture;
-        _blurTmpTexture = cached.blurTmpTexture;
-        _blurredTexture = cached.blurredTexture;
-        if (cached.bakedBlurRadius == _blur) {
+        _cacheEntry = cached;
+        _bgTexture = cached.bgTexture;
+        LGBlurVariant *variant = cached.blurVariants[LGBlurSettingKey(_blur)];
+        _blurredTexture = variant.texture;
+        if (variant.texture) {
             _needsBlurBake       = NO;
-            _lastBakedBlurRadius = cached.bakedBlurRadius;
+            _lastBakedBlurRadius = variant.bakedBlurRadius;
         } else {
             _needsBlurBake       = YES;
             _lastBakedBlurRadius = -1;
@@ -1855,15 +1928,12 @@ static void LG_prewarmPipelines(void) {
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                           width:w height:h mipmapped:NO];
     rd.usage        = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    _blurTmpTexture = [sDevice newTextureWithDescriptor:rd];
-    _blurredTexture = [sDevice newTextureWithDescriptor:rd];
+    _blurredTexture = nil;
 
     LGTextureCache *entry   = [LGTextureCache new];
     entry.bgTexture         = _bgTexture;
-    entry.blurTmpTexture    = _blurTmpTexture;
-    entry.blurredTexture    = _blurredTexture;
     entry.bridge            = bridge;
-    entry.bakedBlurRadius   = -1;
+    entry.blurVariants      = [NSMutableDictionary dictionary];
     _cacheEntry             = entry;
     LG_setCacheForImage(image, textureScale, entry);
 
@@ -1898,12 +1968,24 @@ static void LG_prewarmPipelines(void) {
     [blur encodeToCommandBuffer:cmdBuf sourceTexture:_bgTexture destinationTexture:_blurredTexture];
 }
 
+- (void)_ensureBlurTexture {
+    if (_blurredTexture || !_bgTexture) return;
+    MTLTextureDescriptor *rd =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                          width:_bgTexture.width
+                                                         height:_bgTexture.height
+                                                      mipmapped:NO];
+    rd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    _blurredTexture = [sDevice newTextureWithDescriptor:rd];
+}
+
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
     _hasCachedVisualMetrics = NO;
 }
 
 - (void)drawInMTKView:(MTKView *)view {
     if (!_bgTexture && self.wallpaperImage) [self _reloadTexture];
+    if (_bgTexture && !_blurredTexture) [self _ensureBlurTexture];
     if (!sPipeline || !_bgTexture || !_blurredTexture) return;
     [self _refreshVisualMetrics];
     CGSize drawableSize = _cachedDrawableSizePx;
@@ -1915,17 +1997,25 @@ static void LG_prewarmPipelines(void) {
     if (!cmdBuf) return;
 
     CGFloat scale = UIScreen.mainScreen.scale;
-    static CGFloat screenW = 0, screenH = 0;
-    if (!screenW || !screenH) {
-        screenW = UIScreen.mainScreen.bounds.size.width  * scale;
-        screenH = UIScreen.mainScreen.bounds.size.height * scale;
-    }
+    CGFloat screenW = UIScreen.mainScreen.bounds.size.width  * scale;
+    CGFloat screenH = UIScreen.mainScreen.bounds.size.height * scale;
 
     float visOriginX = CGRectGetMinX(_cachedVisualRectPx);
     float visOriginY = CGRectGetMinY(_cachedVisualRectPx);
     float visW = CGRectGetWidth(_cachedVisualRectPx);
     float visH = CGRectGetHeight(_cachedVisualRectPx);
     float visualScale = _cachedVisualScale;
+    float samplingOrientation = LG_samplingOrientationForGlassView(self, _updateGroup);
+
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        LGDebugLog(@"glass draw group=%ld screenPx={%.1f %.1f} visualPx=%@ drawable=%@ wallpaperPx=%@ wallpaperOrigin=%@",
+                   (long)_updateGroup,
+                   screenW, screenH,
+                   NSStringFromCGRect(_cachedVisualRectPx),
+                   NSStringFromCGSize(drawableSize),
+                   NSStringFromCGSize(_sourceWallpaperPixelSize),
+                   NSStringFromCGPoint(_wallpaperOriginPt));
+    }
 
     float imgW      = (float)_bgTexture.width;
     float imgH      = (float)_bgTexture.height;
@@ -1933,12 +2023,27 @@ static void LG_prewarmPipelines(void) {
     // smaller textures need less blur work
     float blurPx    = (float)_blur * (float)scale / fillScale;
 
+    if ((_needsBlurBake || blurPx != _lastBakedBlurRadius) && _cacheEntry) {
+        LGBlurVariant *variant = _cacheEntry.blurVariants[LGBlurSettingKey(_blur)];
+        if (variant.texture) {
+            _blurredTexture = variant.texture;
+            _lastBakedBlurRadius = variant.bakedBlurRadius;
+            _needsBlurBake = NO;
+        }
+    }
+
     if (_needsBlurBake || blurPx != _lastBakedBlurRadius) {
+        [self _ensureBlurTexture];
         [self _runBlurPassesWithRadius:blurPx commandBuffer:cmdBuf];
         _lastBakedBlurRadius = blurPx;
         _needsBlurBake       = NO;
         LGTextureCache *entry = _cacheEntry;
-        if (entry) entry.bakedBlurRadius = _blur;
+        if (entry) {
+            LGBlurVariant *variant = [LGBlurVariant new];
+            variant.texture = _blurredTexture;
+            variant.bakedBlurRadius = blurPx;
+            entry.blurVariants[LGBlurSettingKey(_blur)] = variant;
+        }
     }
 
     id<MTLRenderCommandEncoder> enc =
@@ -1959,6 +2064,7 @@ static void LG_prewarmPipelines(void) {
         .blur             = blurPx,
         .wallpaperOrigin  = { (float)(_wallpaperOriginPt.x * scale),
                               (float)(_wallpaperOriginPt.y * scale) },
+        .samplingOrientation = samplingOrientation,
     };
     [enc setRenderPipelineState:sPipeline];
     [enc setVertexBytes:&u   length:sizeof(u) atIndex:0];
@@ -2025,6 +2131,9 @@ static void LG_requestRespring(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         LG_prewarmPipelines();
     });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        LG_startLegacyWallpaperWatcher();
+    });
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL,
                                     LG_preferencesChanged,
@@ -2043,8 +2152,13 @@ static void LG_pushWallpaperToTree(UIView *root) {
     static Class glassClass;
     if (!glassClass) glassClass = [LiquidGlassView class];
     if ([root isKindOfClass:glassClass]) {
-        ((LiquidGlassView *)root).wallpaperImage = sCachedSnapshot;
-        [(LiquidGlassView *)root updateOrigin];
+        LiquidGlassView *glass = (LiquidGlassView *)root;
+        CGPoint wallpaperOrigin = CGPointZero;
+        if (sCachedSnapshot) (void)LG_getHomescreenSnapshot(&wallpaperOrigin);
+        glass.wallpaperImage = nil;
+        glass.wallpaperImage = sCachedSnapshot;
+        glass.wallpaperOrigin = wallpaperOrigin;
+        [glass updateOrigin];
         return;
     }
     for (UIView *sub in root.subviews) LG_pushWallpaperToTree(sub);
@@ -2057,6 +2171,7 @@ static void LG_pushConfiguredBackdropToTree(UIView *root, LGUpdateGroup group, U
     if ([root isKindOfClass:glassClass]) {
         LiquidGlassView *glass = (LiquidGlassView *)root;
         if (glass.updateGroup == group) {
+            glass.wallpaperImage = nil;
             glass.wallpaperImage = image;
             if (group == LGUpdateGroupLockscreen)
                 glass.wallpaperOrigin = LG_getLockscreenWallpaperOrigin();
@@ -2070,8 +2185,13 @@ static void LG_pushConfiguredBackdropToTree(UIView *root, LGUpdateGroup group, U
 
 static void LG_pushSnapshotToAllGlassViews(void) {
     if (!sCachedSnapshot) return;
-    UIWindow *homescreenWindow = LG_getHomescreenWindow();
-    if (homescreenWindow) LG_pushWallpaperToTree(homescreenWindow);
+    static Class sceneCls;
+    if (!sceneCls) sceneCls = [UIWindowScene class];
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:sceneCls]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows)
+            LG_pushWallpaperToTree(window);
+    }
 }
 
 static void LG_pushLockscreenSnapshotToAllGlassViews(void) {
@@ -2088,6 +2208,43 @@ static void LG_pushLockscreenSnapshotToAllGlassViews(void) {
     }
 }
 
+static void LG_scheduleHomescreenWallpaperRefresh(NSString *reason, UIImage *image) {
+    if (!LG_globalEnabled()) return;
+    if (image) sInterceptedWallpaperImage = image;
+    LGResetHomescreenSnapshotCaches();
+    NSUInteger token = ++sPendingHomescreenWallpaperRefreshToken;
+    LGDebugLog(@"homescreen wallpaper refresh scheduled reason=%@", reason ?: @"(unknown)");
+    LGScheduleBlockAfterDelay(0.30, ^{
+        if (!LG_globalEnabled()) return;
+        if (token != sPendingHomescreenWallpaperRefreshToken) return;
+        LGDebugLog(@"homescreen wallpaper refresh begin reason=%@", reason ?: @"(unknown)");
+        LG_refreshHomescreenSnapshot();
+        if (sCachedSnapshot) {
+            LG_pushSnapshotToAllGlassViews();
+            LGWarmTransientSnapshotsAfterDelay(0.12);
+        } else {
+            LG_trySnapshotWithRetry();
+        }
+    });
+}
+
+static void LG_scheduleLockscreenWallpaperRefresh(NSString *reason) {
+    if (!LG_globalEnabled()) return;
+    sCachedSpringBoardLockImage = nil;
+    sCachedSpringBoardLockMTime = nil;
+    sCachedSpringBoardLockPath = nil;
+    LGInvalidateLockscreenSnapshotCache();
+    NSUInteger token = ++sPendingLockscreenWallpaperRefreshToken;
+    LGDebugLog(@"lockscreen wallpaper refresh scheduled reason=%@", reason ?: @"(unknown)");
+    LGScheduleBlockAfterDelay(0.30, ^{
+        if (!LG_globalEnabled()) return;
+        if (token != sPendingLockscreenWallpaperRefreshToken) return;
+        LGDebugLog(@"lockscreen wallpaper refresh begin reason=%@", reason ?: @"(unknown)");
+        LG_pushLockscreenSnapshotToAllGlassViews();
+        LG_updateRegisteredGlassViews(LGUpdateGroupLockscreen);
+    });
+}
+
 static void LG_handlePrefsChanged(void) {
     LGLog(@"preferences changed");
     sCachedSnapshot = nil;
@@ -2100,6 +2257,7 @@ static void LG_handlePrefsChanged(void) {
     sCachedSpringBoardLockMTime = nil;
     sCachedSpringBoardHomePath = nil;
     sCachedSpringBoardLockPath = nil;
+    LGInvalidateLockscreenSnapshotCache();
 
     if (!LG_globalEnabled()) return;
 
@@ -2120,13 +2278,17 @@ static void LG_handlePrefsChanged(void) {
 static void LG_trySnapshotWithRetry(void) {
     if (!LG_globalEnabled()) return;
     if (sCachedSnapshot) return;
+    if (sSnapshotRetryScheduled) return;
     LG_refreshHomescreenSnapshot();
     if (sCachedSnapshot) {
         LG_pushSnapshotToAllGlassViews();
         return;
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ LG_trySnapshotWithRetry(); });
+    sSnapshotRetryScheduled = YES;
+    LGScheduleBlockAfterDelay(2.0, ^{
+        sSnapshotRetryScheduled = NO;
+        LG_trySnapshotWithRetry();
+    });
 }
 
 %hook UIImageView
@@ -2135,21 +2297,24 @@ static void LG_trySnapshotWithRetry(void) {
     %orig;
     if (!LG_globalEnabled()) return;
     if (!image) return;
-    if (sInterceptedWallpaperImage) return;
     CGSize screen = UIScreen.mainScreen.bounds.size;
     if (image.size.width < screen.width * 0.5) return;
-    static Class replicaCls;
+    static Class replicaCls, homePosterVCCls, lockPosterVCCls;
     if (!replicaCls) replicaCls = NSClassFromString(@"PBUISnapshotReplicaView");
-    UIView *v = self.superview;
-    while (v) {
-        if ([v isKindOfClass:replicaCls]) {
-            sInterceptedWallpaperImage = image;
-            sCachedSnapshot = nil;
-            LG_refreshHomescreenSnapshot();
-            if (sCachedSnapshot) LG_pushSnapshotToAllGlassViews();
-            return;
+    if (!homePosterVCCls) homePosterVCCls = NSClassFromString(@"PBUIPosterHomeViewController");
+    if (!lockPosterVCCls) lockPosterVCCls = NSClassFromString(@"PBUIPosterLockViewController");
+    if (LG_viewMatchesHierarchyClass(self, replicaCls) &&
+        LG_viewMatchesHierarchyClass(self, homePosterVCCls)) {
+        BOOL sameImage = (sInterceptedWallpaperImage == image);
+        if (!sameImage || !sCachedSnapshot) {
+            LG_scheduleHomescreenWallpaperRefresh(@"poster-home-image", image);
         }
-        v = v.superview;
+        return;
+    }
+    if (LG_viewMatchesHierarchyClass(self, replicaCls) &&
+        LG_viewMatchesHierarchyClass(self, lockPosterVCCls)) {
+        LG_scheduleLockscreenWallpaperRefresh(@"poster-lock-image");
+        return;
     }
 }
 
@@ -2163,14 +2328,62 @@ static void LG_trySnapshotWithRetry(void) {
     LG_trySnapshotWithRetry();
     NSArray<NSNumber *> *delays = @[@0.12, @0.28, @0.55];
     for (NSNumber *delayNumber in delays) {
-        NSTimeInterval delay = delayNumber.doubleValue;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
+        LGScheduleBlockAfterDelay(delayNumber.doubleValue, ^{
             if (!LG_globalEnabled()) return;
             if (!LG_getFolderSnapshot())
                 LG_cacheFolderSnapshot();
         });
     }
+}
+
+- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id)coordinator {
+    UIViewController *vc = (UIViewController *)self;
+    UIInterfaceOrientation beforeOrientation = UIInterfaceOrientationUnknown;
+    if (@available(iOS 13.0, *)) {
+        if (vc.view.window.windowScene)
+            beforeOrientation = vc.view.window.windowScene.interfaceOrientation;
+    }
+    LGDebugLog(@"homescreen rotation will size=%@ beforeOrientation=%ld screen=%@ snapshot=%@",
+               NSStringFromCGSize(size),
+               (long)beforeOrientation,
+               NSStringFromCGSize(UIScreen.mainScreen.bounds.size),
+               sCachedSnapshot ? NSStringFromCGSize(sCachedSnapshot.size) : @"(null)");
+    %orig;
+    if (![coordinator respondsToSelector:@selector(animateAlongsideTransition:completion:)]) return;
+    [coordinator animateAlongsideTransition:^(__unused id context) {
+        UIInterfaceOrientation duringOrientation = UIInterfaceOrientationUnknown;
+        if (@available(iOS 13.0, *)) {
+            if (vc.view.window.windowScene)
+                duringOrientation = vc.view.window.windowScene.interfaceOrientation;
+        }
+        LGDebugLog(@"homescreen rotation alongside orientation=%ld screen=%@",
+                   (long)duringOrientation,
+                   NSStringFromCGSize(UIScreen.mainScreen.bounds.size));
+    } completion:^(__unused id context) {
+        if (LG_globalEnabled()) {
+            sCachedSnapshot = nil;
+            LG_invalidateFolderSnapshot();
+            LG_invalidateContextMenuSnapshot();
+            LG_refreshHomescreenSnapshot();
+            if (sCachedSnapshot) {
+                LG_pushSnapshotToAllGlassViews();
+            } else {
+                LG_trySnapshotWithRetry();
+            }
+        }
+        UIInterfaceOrientation afterOrientation = UIInterfaceOrientationUnknown;
+        if (@available(iOS 13.0, *)) {
+            if (vc.view.window.windowScene)
+                afterOrientation = vc.view.window.windowScene.interfaceOrientation;
+        }
+        CGPoint origin = CGPointZero;
+        UIImage *snapshot = LG_getHomescreenSnapshot(&origin);
+        LGDebugLog(@"homescreen rotation done orientation=%ld screen=%@ snapshot=%@ origin=%@",
+                   (long)afterOrientation,
+                   NSStringFromCGSize(UIScreen.mainScreen.bounds.size),
+                   snapshot ? NSStringFromCGSize(snapshot.size) : @"(null)",
+                   NSStringFromCGPoint(origin));
+    }];
 }
 %end
 
@@ -2186,8 +2399,7 @@ static void LG_trySnapshotWithRetry(void) {
     if (!LG_globalEnabled()) return;
     LG_invalidateFolderSnapshot();
     LG_invalidateContextMenuSnapshot();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
+    LGScheduleBlockAfterDelay(0.10, ^{
         if (!LG_globalEnabled()) return;
         LG_cacheFolderSnapshot();
         LG_cacheContextMenuSnapshot();
@@ -2200,8 +2412,7 @@ static void LG_trySnapshotWithRetry(void) {
     if (!LG_globalEnabled()) return;
     LG_invalidateFolderSnapshot();
     LG_invalidateContextMenuSnapshot();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
+    LGScheduleBlockAfterDelay(0.10, ^{
         if (!LG_globalEnabled()) return;
         LG_trySnapshotWithRetry();
         if (!LG_getFolderSnapshot())
@@ -2240,7 +2451,7 @@ static BOOL LG_shouldCacheSnapshotsForLongPress(UIGestureRecognizer *gesture) {
     %orig;
     if (state != UIGestureRecognizerStateBegan) return;
     if (!LG_shouldCacheSnapshotsForLongPress(self)) return;
-    LGLog(@"long press snapshot warmup");
+    LGDebugLog(@"long press snapshot warmup");
     LG_cacheFolderSnapshot();
     LG_cacheContextMenuSnapshot();
 }

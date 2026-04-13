@@ -1,7 +1,6 @@
 #import "../LiquidGlass.h"
 #import <objc/runtime.h>
 
-static const NSInteger kFolderOpenMaxAttempts = 6;
 static const NSTimeInterval kFolderOpenDisplayLinkGrace = 0.18;
 static const NSInteger kFolderOpenTintTag = 0xF0D0;
 static void *kFolderOpenOriginalAlphaKey = &kFolderOpenOriginalAlphaKey;
@@ -21,10 +20,25 @@ static BOOL isInsideOpenFolder(UIView *view) {
     return NO;
 }
 
+static UIView *folderOpenContainerForView(UIView *view) {
+    static Class cls;
+    if (!cls) cls = NSClassFromString(@"SBFolderBackgroundView");
+    UIView *v = view;
+    while (v) {
+        if ([v isKindOfClass:cls]) return v;
+        v = v.superview;
+    }
+    return nil;
+}
+
 static void stopFolderDisplayLink(void);
+static void scheduleFolderDisplayLinkStopIfIdle(void);
 static void LGFolderOpenRefreshAllHosts(void);
 static void LGFolderOpenTraverseViews(UIView *root, void (^block)(UIView *view));
+static void LGFolderOpenForEachMaterialHost(void (^block)(UIView *view));
 static void LGRestoreFolderOpenHost(UIView *view);
+static void LGDetachFolderOpenHost(UIView *view);
+static void LGHandleFolderOpenMaterialView(UIView *view, BOOL updateOnly);
 
 static NSInteger sFolderCount = 0;
 static NSUInteger sFolderStopGeneration = 0;
@@ -108,31 +122,65 @@ static void scheduleFolderDisplayLinkStopIfIdle(void) {
     });
 }
 
+static UIView *LGPrimaryFolderOpenHostForContainer(UIView *container) {
+    if (!container) return nil;
+    __block UIView *bestView = nil;
+    __block CGFloat bestArea = 0.0;
+    Class materialCls = NSClassFromString(@"MTMaterialView");
+    LGFolderOpenTraverseViews(container, ^(UIView *view) {
+        if (view == container) return;
+        if (!materialCls || ![view isKindOfClass:materialCls]) return;
+        if (view.hidden || view.alpha <= 0.01f || view.layer.opacity <= 0.01f) return;
+        CGSize size = view.bounds.size;
+        if (size.width < 120.0 || size.height < 120.0) return;
+        CGFloat area = size.width * size.height;
+        if (area > bestArea) {
+            bestArea = area;
+            bestView = view;
+        }
+    });
+    return bestView;
+}
+
+static BOOL LGIsPrimaryFolderOpenHost(UIView *view) {
+    UIView *container = folderOpenContainerForView(view);
+    if (!container) return NO;
+    return LGPrimaryFolderOpenHostForContainer(container) == view;
+}
+
 static void LGRestoreFolderOpenHost(UIView *view) {
     UIView *tint = objc_getAssociatedObject(view, kFolderOpenTintKey);
     if (tint) [tint removeFromSuperview];
     objc_setAssociatedObject(view, kFolderOpenTintKey, nil, OBJC_ASSOCIATION_ASSIGN);
+
     LiquidGlassView *glass = objc_getAssociatedObject(view, kFolderOpenGlassKey);
     if (glass) [glass removeFromSuperview];
     objc_setAssociatedObject(view, kFolderOpenGlassKey, nil, OBJC_ASSOCIATION_ASSIGN);
+
     NSNumber *originalAlpha = objc_getAssociatedObject(view, kFolderOpenOriginalAlphaKey);
     if (originalAlpha) view.alpha = [originalAlpha doubleValue];
 }
 
-static void injectIntoOpenFolder(UIView *host, NSInteger attempt) {
+static void LGDetachFolderOpenHost(UIView *view) {
+    LGRestoreFolderOpenHost(view);
+    if (![objc_getAssociatedObject(view, kFolderOpenAttachedKey) boolValue]) return;
+    objc_setAssociatedObject(view, kFolderOpenAttachedKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    sFolderCount = MAX(0, sFolderCount - 1);
+    if (sFolderCount == 0) scheduleFolderDisplayLinkStopIfIdle();
+}
+
+static void injectIntoOpenFolder(UIView *host) {
     if (!LGFolderOpenEnabled()) {
-        LGRestoreFolderOpenHost(host);
+        LGDetachFolderOpenHost(host);
+        return;
+    }
+    if (!LGIsPrimaryFolderOpenHost(host)) {
+        LGDetachFolderOpenHost(host);
         return;
     }
 
-    LiquidGlassView *glass = objc_getAssociatedObject(host, kFolderOpenGlassKey);
     UIImage *snapshot = LG_getFolderSnapshot();
     if (LG_imageLooksBlack(snapshot)) snapshot = nil;
-    if (!snapshot) {
-        LG_cacheFolderSnapshot();
-        snapshot = LG_getFolderSnapshot();
-        if (LG_imageLooksBlack(snapshot)) snapshot = nil;
-    }
     if (!snapshot) {
         snapshot = LG_getStrictCachedContextMenuSnapshot();
         if (LG_imageLooksBlack(snapshot)) snapshot = nil;
@@ -140,18 +188,13 @@ static void injectIntoOpenFolder(UIView *host, NSInteger attempt) {
     if (!snapshot) {
         NSNumber *originalAlpha = objc_getAssociatedObject(host, kFolderOpenOriginalAlphaKey);
         if (originalAlpha) host.alpha = [originalAlpha doubleValue];
-        if (attempt >= kFolderOpenMaxAttempts) return;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (host.window) injectIntoOpenFolder(host, attempt + 1);
-        });
         return;
     }
 
-    if (!objc_getAssociatedObject(host, kFolderOpenOriginalAlphaKey)) {
+    if (!objc_getAssociatedObject(host, kFolderOpenOriginalAlphaKey))
         objc_setAssociatedObject(host, kFolderOpenOriginalAlphaKey, @(host.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
 
+    LiquidGlassView *glass = objc_getAssociatedObject(host, kFolderOpenGlassKey);
     if (!glass) {
         glass = [[LiquidGlassView alloc] initWithFrame:host.bounds
                                              wallpaper:snapshot
@@ -175,6 +218,11 @@ static void injectIntoOpenFolder(UIView *host, NSInteger attempt) {
     glass.wallpaperScale = LGFolderOpenWallpaperScale();
     ensureFolderOpenTintOverlay(host);
     [glass updateOrigin];
+
+    if (![objc_getAssociatedObject(host, kFolderOpenAttachedKey) boolValue]) {
+        objc_setAssociatedObject(host, kFolderOpenAttachedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        sFolderCount++;
+    }
     startFolderDisplayLink();
 }
 
@@ -184,7 +232,8 @@ static void LGFolderOpenTraverseViews(UIView *root, void (^block)(UIView *view))
     for (UIView *sub in root.subviews) LGFolderOpenTraverseViews(sub, block);
 }
 
-static void LGFolderOpenRefreshAllHosts(void) {
+static void LGFolderOpenForEachMaterialHost(void (^block)(UIView *view)) {
+    if (!block) return;
     UIApplication *app = UIApplication.sharedApplication;
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in app.connectedScenes) {
@@ -193,7 +242,7 @@ static void LGFolderOpenRefreshAllHosts(void) {
                 LGFolderOpenTraverseViews(window, ^(UIView *view) {
                     if (![view isKindOfClass:NSClassFromString(@"MTMaterialView")]) return;
                     if (!isInsideOpenFolder(view)) return;
-                    injectIntoOpenFolder(view, 0);
+                    block(view);
                 });
             }
         }
@@ -202,10 +251,47 @@ static void LGFolderOpenRefreshAllHosts(void) {
             LGFolderOpenTraverseViews(window, ^(UIView *view) {
                 if (![view isKindOfClass:NSClassFromString(@"MTMaterialView")]) return;
                 if (!isInsideOpenFolder(view)) return;
-                injectIntoOpenFolder(view, 0);
+                block(view);
             });
         }
     }
+}
+
+static void LGHandleFolderOpenMaterialView(UIView *view, BOOL updateOnly) {
+    if (!view) return;
+    if (!view.window) {
+        LGDetachFolderOpenHost(view);
+        return;
+    }
+    if (!isInsideOpenFolder(view) || !LGIsPrimaryFolderOpenHost(view) || !LGFolderOpenEnabled()) {
+        LGDetachFolderOpenHost(view);
+        return;
+    }
+    if (!updateOnly) {
+        injectIntoOpenFolder(view);
+        return;
+    }
+    LiquidGlassView *glass = objc_getAssociatedObject(view, kFolderOpenGlassKey);
+    ensureFolderOpenTintOverlay(view);
+    if (!glass) {
+        injectIntoOpenFolder(view);
+        return;
+    }
+    glass.cornerRadius = LGFolderOpenCornerRadius();
+    glass.bezelWidth = LGFolderOpenBezelWidth();
+    glass.glassThickness = LGFolderOpenGlassThickness();
+    glass.refractionScale = LGFolderOpenRefractionScale();
+    glass.refractiveIndex = LGFolderOpenRefractiveIndex();
+    glass.specularOpacity = LGFolderOpenSpecularOpacity();
+    glass.blur = LGFolderOpenBlur();
+    glass.wallpaperScale = LGFolderOpenWallpaperScale();
+    [glass updateOrigin];
+}
+
+static void LGFolderOpenRefreshAllHosts(void) {
+    LGFolderOpenForEachMaterialHost(^(UIView *view) {
+        LGHandleFolderOpenMaterialView(view, NO);
+    });
 }
 
 static void LGFolderOpenPrefsChanged(CFNotificationCenterRef center,
@@ -214,6 +300,13 @@ static void LGFolderOpenPrefsChanged(CFNotificationCenterRef center,
                                      const void *object,
                                      CFDictionaryRef userInfo) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (!LGFolderOpenEnabled()) {
+            LGFolderOpenForEachMaterialHost(^(UIView *view) {
+                LGDetachFolderOpenHost(view);
+            });
+            stopFolderDisplayLink();
+            return;
+        }
         LGFolderOpenRefreshAllHosts();
     });
 }
@@ -223,44 +316,13 @@ static void LGFolderOpenPrefsChanged(CFNotificationCenterRef center,
 - (void)didMoveToWindow {
     %orig;
     UIView *self_ = (UIView *)self;
-
-    if (!self_.window) {
-        LGRestoreFolderOpenHost(self_);
-        if ([objc_getAssociatedObject(self_, kFolderOpenAttachedKey) boolValue]) {
-            objc_setAssociatedObject(self_, kFolderOpenAttachedKey, nil, OBJC_ASSOCIATION_ASSIGN);
-            sFolderCount = MAX(0, sFolderCount - 1);
-            if (sFolderCount == 0) scheduleFolderDisplayLinkStopIfIdle();
-        }
-        return;
-    }
-
-    if (!isInsideOpenFolder(self_)) return;
-    injectIntoOpenFolder(self_, 0);
-    if (![objc_getAssociatedObject(self_, kFolderOpenAttachedKey) boolValue]) {
-        objc_setAssociatedObject(self_, kFolderOpenAttachedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        sFolderCount++;
-        startFolderDisplayLink();
-    }
+    LGHandleFolderOpenMaterialView(self_, NO);
 }
 
 - (void)layoutSubviews {
     %orig;
     UIView *self_ = (UIView *)self;
-    if (!isInsideOpenFolder(self_)) return;
-    if (!LGFolderOpenEnabled()) {
-        LGRestoreFolderOpenHost(self_);
-        return;
-    }
-    if (!objc_getAssociatedObject(self_, kFolderOpenOriginalAlphaKey)) {
-        objc_setAssociatedObject(self_, kFolderOpenOriginalAlphaKey, @(self_.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    LiquidGlassView *glass = objc_getAssociatedObject(self_, kFolderOpenGlassKey);
-    ensureFolderOpenTintOverlay(self_);
-    if (!glass) {
-        injectIntoOpenFolder(self_, 0);
-        return;
-    }
-    [glass updateOrigin];
+    LGHandleFolderOpenMaterialView(self_, YES);
 }
 
 %end

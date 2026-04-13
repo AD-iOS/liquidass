@@ -2,6 +2,14 @@
 #import "../Shared/LGGlassRenderer.h"
 #import <QuartzCore/QuartzCore.h>
 
+static void LGPrefsSwitchLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSLog(@"[LiquidAss][Settings] %@", message);
+}
+
 static BOOL LGSwitchIsDarkMode(UITraitCollection *traitCollection) {
     if (@available(iOS 12.0, *)) {
         return traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
@@ -28,6 +36,36 @@ static UIColor *LGSwitchGlassLiftColor(UITraitCollection *traitCollection) {
         return [UIColor colorWithWhite:1.0 alpha:0.14];
     }
     return [UIColor colorWithWhite:1.0 alpha:0.0];
+}
+
+static BOOL LGSwitchColorLooksTooDarkForAccent(UIColor *color) {
+    if (!color) return YES;
+    CGFloat r = 0.0, g = 0.0, b = 0.0, a = 0.0;
+    if (![color getRed:&r green:&g blue:&b alpha:&a]) {
+        CGFloat white = 0.0;
+        if ([color getWhite:&white alpha:&a]) {
+            r = g = b = white;
+        } else {
+            return NO;
+        }
+    }
+    return a > 0.01 && r < 0.12 && g < 0.12 && b < 0.12;
+}
+
+static UIColor *LGSwitchEffectiveAccentColor(UISwitch *toggle) {
+    NSArray<UIColor *> *candidates = @[
+        toggle.onTintColor ?: UIColor.clearColor,
+        toggle.window.tintColor ?: UIColor.clearColor,
+        toggle.superview.tintColor ?: UIColor.clearColor,
+        toggle.tintColor ?: UIColor.clearColor,
+        UIColor.systemGreenColor
+    ];
+    for (UIColor *candidate in candidates) {
+        if (!candidate || candidate == UIColor.clearColor) continue;
+        if (LGSwitchColorLooksTooDarkForAccent(candidate)) continue;
+        return candidate;
+    }
+    return UIColor.systemGreenColor;
 }
 
 static UIImage *LGRenderSwitchBackdropImage(CGSize size,
@@ -141,6 +179,7 @@ static UIImage *LGRenderSwitchBackdropImage(CGSize size,
 @property (nonatomic, assign) CFTimeInterval lastDisplayLinkTimestamp;
 @property (nonatomic, assign) BOOL isDragging;
 @property (nonatomic, assign) BOOL didToggleDuringDrag;
+@property (nonatomic, assign) BOOL didSendValueChangedDuringDrag;
 @property (nonatomic, assign) BOOL wasOnWhenDragStarted;
 @property (nonatomic, assign) CFTimeInterval touchBeganTime;
 @property (nonatomic, assign) CGFloat dragStartLocation;
@@ -161,6 +200,11 @@ static UIImage *LGRenderSwitchBackdropImage(CGSize size,
     if (!self) return nil;
     [self commonInit];
     return self;
+}
+
+- (void)dealloc {
+    LGPrefsSwitchLog(@"switch dealloc self=%p displayLink=%p window=%p", self, self.displayLink, self.window);
+    [self stopDisplayLink];
 }
 
 - (CGSize)intrinsicContentSize {
@@ -283,6 +327,7 @@ static UIImage *LGRenderSwitchBackdropImage(CGSize size,
     self.dragMoved = NO;
     self.isDragging = NO;
     self.didToggleDuringDrag = NO;
+    self.didSendValueChangedDuringDrag = NO;
     self.wasOnWhenDragStarted = self.isOn;
     self.touchBeganTime = CACurrentMediaTime();
     self.dragStartLocation = location.x;
@@ -351,6 +396,9 @@ static UIImage *LGRenderSwitchBackdropImage(CGSize size,
         self.targetThumbSize = CGSizeMake(36.0, 24.0);
         self.targetProgress = self.isOn ? 1.0 : 0.0;
         [self setFillVisible:self.isOn animated:YES];
+        if (self.didToggleDuringDrag || self.dragMoved || self.isDragging) {
+            [self finishDragInteraction];
+        }
     }
     self.dragMoved = NO;
     self.isDragging = NO;
@@ -376,6 +424,7 @@ static UIImage *LGRenderSwitchBackdropImage(CGSize size,
     self.dragMoved = NO;
     self.isDragging = NO;
     self.didToggleDuringDrag = NO;
+    self.didSendValueChangedDuringDrag = NO;
     self.pendingTapAutoContract = NO;
     self.targetExpansion = 0.0;
     self.targetThumbSize = CGSizeMake(36.0, 24.0);
@@ -452,7 +501,10 @@ static UIImage *LGRenderSwitchBackdropImage(CGSize size,
     self.didToggleDuringDrag = YES;
     [self.feedbackGenerator impactOccurred];
     [super setOn:newState animated:NO];
+    self.targetProgress = newState ? 1.0 : 0.0;
     [self setFillVisible:newState animated:YES];
+    [self sendActionsForControlEvents:UIControlEventValueChanged];
+    self.didSendValueChangedDuringDrag = YES;
 }
 
 - (void)finishDragInteraction {
@@ -464,11 +516,12 @@ static UIImage *LGRenderSwitchBackdropImage(CGSize size,
             [self sendActionsForControlEvents:UIControlEventValueChanged];
         }
         [self setFillVisible:newOn animated:YES];
-    } else if (self.isOn != self.wasOnWhenDragStarted) {
+    } else if (!self.didSendValueChangedDuringDrag && self.isOn != self.wasOnWhenDragStarted) {
         [self sendActionsForControlEvents:UIControlEventValueChanged];
     }
     self.targetProgress = self.isOn ? 1.0 : 0.0;
     self.didToggleDuringDrag = NO;
+    self.didSendValueChangedDuringDrag = NO;
 }
 
 - (void)syncRenderedStateImmediately {
@@ -550,7 +603,7 @@ static UIImage *LGRenderSwitchBackdropImage(CGSize size,
 }
 
 - (void)updateMaterialColors {
-    UIColor *accent = self.onTintColor ?: UIColor.systemBlueColor;
+    UIColor *accent = LGSwitchEffectiveAccentColor(self);
     BOOL darkMode = LGSwitchIsDarkMode(self.traitCollection);
     self.trackView.backgroundColor = LGSwitchOffTrackColor(self.traitCollection);
     self.fillView.backgroundColor = [accent colorWithAlphaComponent:darkMode ? 0.78 : 0.92];
@@ -575,7 +628,7 @@ static UIImage *LGRenderSwitchBackdropImage(CGSize size,
     CGRect captureRect = CGRectInset(trackFrame, -20.0, -20.0);
     UIColor *backgroundColor = self.superview.backgroundColor ?: (self.window.backgroundColor ?: [UIColor systemBackgroundColor]);
     UIColor *trackColor = LGSwitchOffTrackColor(self.traitCollection);
-    UIColor *baseFillColor = self.fillView.backgroundColor ?: (self.onTintColor ?: [UIColor systemBlueColor]);
+    UIColor *baseFillColor = self.fillView.backgroundColor ?: LGSwitchEffectiveAccentColor(self);
     UIColor *sheenColor = LGSwitchBackdropSheenColor(self.traitCollection);
     UIColor *liftColor = LGSwitchGlassLiftColor(self.traitCollection);
     CGRect localTrackRect = CGRectOffset(trackFrame, -CGRectGetMinX(captureRect), -CGRectGetMinY(captureRect));

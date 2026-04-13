@@ -2,7 +2,8 @@ include $(THEOS)/makefiles/common.mk
 
 BUNDLE_NAME = LiquidAssPrefs
 
-LiquidAssPrefs_FILES = LGPRootListController.m LGPrefsLiquidSlider.m LGPrefsLiquidSwitch.m ../Shared/LGGlassRenderer.m
+PREF_SHARED_FILES := $(wildcard ../Shared/*.m)
+LiquidAssPrefs_FILES = LGPRootListController.m $(PREF_SHARED_FILES)
 LiquidAssPrefs_FRAMEWORKS = UIKit MetalKit MetalPerformanceShaders
 LiquidAssPrefs_INSTALL_PATH = /Library/PreferenceBundles
 LiquidAssPrefs_CFLAGS = -fobjc-arc -I../Shared

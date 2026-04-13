@@ -3,6 +3,14 @@
 #import <objc/runtime.h>
 #import <QuartzCore/QuartzCore.h>
 
+static void LGPrefsSliderLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSLog(@"[LiquidAss][Settings] %@", message);
+}
+
 static UIImage *LGTransparentThumbImage(CGSize size) {
     if (size.width <= 0 || size.height <= 0) return nil;
     UIGraphicsBeginImageContextWithOptions(size, NO, 0);
@@ -21,6 +29,36 @@ static UIColor *LGSliderFallbackTrackColor(void) {
         }];
     }
     return [[UIColor blackColor] colorWithAlphaComponent:0.14];
+}
+
+static BOOL LGSliderColorLooksTooDarkForAccent(UIColor *color) {
+    if (!color) return YES;
+    CGFloat r = 0.0, g = 0.0, b = 0.0, a = 0.0;
+    if (![color getRed:&r green:&g blue:&b alpha:&a]) {
+        CGFloat white = 0.0;
+        if ([color getWhite:&white alpha:&a]) {
+            r = g = b = white;
+        } else {
+            return NO;
+        }
+    }
+    return a > 0.01 && r < 0.12 && g < 0.12 && b < 0.12;
+}
+
+static UIColor *LGSliderEffectiveAccentColor(UISlider *slider) {
+    NSArray<UIColor *> *candidates = @[
+        slider.minimumTrackTintColor ?: UIColor.clearColor,
+        slider.window.tintColor ?: UIColor.clearColor,
+        slider.superview.tintColor ?: UIColor.clearColor,
+        slider.tintColor ?: UIColor.clearColor,
+        UIColor.systemBlueColor
+    ];
+    for (UIColor *candidate in candidates) {
+        if (!candidate || candidate == UIColor.clearColor) continue;
+        if (LGSliderColorLooksTooDarkForAccent(candidate)) continue;
+        return candidate;
+    }
+    return UIColor.systemBlueColor;
 }
 
 static BOOL LGSliderIsDarkMode(UITraitCollection *traitCollection) {
@@ -170,6 +208,11 @@ static UIImage *LGRenderSliderBackdropImage(CGSize size,
     if (!self) return nil;
     [self commonInit];
     return self;
+}
+
+- (void)dealloc {
+    LGPrefsSliderLog(@"slider dealloc self=%p displayLink=%p window=%p", self, self.thumbDisplayLink, self.window);
+    [self stopThumbDisplayLink];
 }
 
 - (void)commonInit {
@@ -575,7 +618,7 @@ static UIImage *LGRenderSliderBackdropImage(CGSize size,
     }
     UIColor *backgroundColor = captureView.backgroundColor ?: (self.superview.backgroundColor ?: [UIColor systemBackgroundColor]);
     UIColor *trackColor = self.maximumTrackTintColor ?: LGSliderFallbackTrackColor();
-    UIColor *fillColor = self.minimumTrackTintColor ?: self.tintColor ?: [UIColor systemBlueColor];
+    UIColor *fillColor = LGSliderEffectiveAccentColor(self);
     UIColor *sheenColor = LGSliderBackdropSheenColor(self.traitCollection);
     UIColor *glassLiftColor = LGSliderActiveGlassLiftColor(self.traitCollection);
     UIImage *snapshot = LGRenderSliderBackdropImage(captureRect.size, backgroundColor, trackColor, fillColor, sheenColor, glassLiftColor,

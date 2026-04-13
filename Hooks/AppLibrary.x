@@ -11,6 +11,7 @@ static BOOL isInsideSearchTextField(UIView *view);
 static UIView *LGAppLibraryPodHostView(UIView *view);
 static void LGAppLibraryPreparePodChildren(UIView *host);
 static void LGEnsureAppLibraryTintOverlay(UIView *host, CGFloat cornerRadius, UIColor *tintColor);
+static BOOL LGHandleSearchFieldMaterialView(UIView *view, BOOL updateOnly);
 
 @interface LGAppLibTicker : NSObject
 - (void)tick:(CADisplayLink *)dl;
@@ -176,6 +177,47 @@ static void LGAppLibraryPreparePodChildren(UIView *host) {
     }
 }
 
+static void LGAppLibraryScheduleRetry(UIView *view, dispatch_block_t block) {
+    if ([objc_getAssociatedObject(view, kAppLibRetryKey) boolValue]) return;
+    objc_setAssociatedObject(view, kAppLibRetryKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        objc_setAssociatedObject(view, kAppLibRetryKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        if (block) block();
+    });
+}
+
+static void LGAppLibraryPrepareHost(UIView *host, CGFloat cornerRadius) {
+    LGAppLibraryRememberOriginalState(host);
+    host.backgroundColor = [UIColor clearColor];
+    host.layer.backgroundColor = nil;
+    host.layer.cornerRadius = cornerRadius;
+    host.layer.masksToBounds = YES;
+    if (@available(iOS 13.0, *))
+        host.layer.cornerCurve = kCACornerCurveContinuous;
+    host.clipsToBounds = YES;
+}
+
+static void LGAppLibraryConfigureGlass(LiquidGlassView *glass,
+                                       CGFloat cornerRadius,
+                                       CGFloat bezelWidth,
+                                       CGFloat glassThickness,
+                                       CGFloat refractionScale,
+                                       CGFloat refractiveIndex,
+                                       CGFloat specularOpacity,
+                                       CGFloat blur,
+                                       CGFloat wallpaperScale) {
+    glass.cornerRadius = cornerRadius;
+    glass.bezelWidth = bezelWidth;
+    glass.glassThickness = glassThickness;
+    glass.refractionScale = refractionScale;
+    glass.refractiveIndex = refractiveIndex;
+    glass.specularOpacity = specularOpacity;
+    glass.blur = blur;
+    glass.wallpaperScale = wallpaperScale;
+    glass.updateGroup = LGUpdateGroupAppLibrary;
+}
+
 static void injectIntoAppLibrary(UIView *self_) {
     UIView *host = LGAppLibraryPodHostView(self_);
     if (!LGAppLibraryEnabled()) {
@@ -188,25 +230,13 @@ static void injectIntoAppLibrary(UIView *self_) {
     UIImage *snapshot = LG_getHomescreenSnapshot(&wallpaperOrigin);
     if (!snapshot) {
         LGAppLibraryRestoreOriginalState(host);
-        // first open can beat the wallpaper cache
-        if ([objc_getAssociatedObject(host, kAppLibRetryKey) boolValue]) return;
-        objc_setAssociatedObject(host, kAppLibRetryKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            objc_setAssociatedObject(host, kAppLibRetryKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        LGAppLibraryScheduleRetry(host, ^{
             injectIntoAppLibrary(self_);
         });
         return;
     }
 
-    LGAppLibraryRememberOriginalState(host);
-    host.backgroundColor = [UIColor clearColor];
-    host.layer.backgroundColor = nil;
-    host.layer.cornerRadius = LGAppLibCornerRadius();
-    host.layer.masksToBounds = YES;
-    if (@available(iOS 13.0, *))
-        host.layer.cornerCurve = kCACornerCurveContinuous;
-    host.clipsToBounds = YES;
+    LGAppLibraryPrepareHost(host, LGAppLibCornerRadius());
 
     LiquidGlassView *glass = objc_getAssociatedObject(host, kAppLibGlassKey);
     if (!glass) {
@@ -220,15 +250,15 @@ static void injectIntoAppLibrary(UIView *self_) {
     } else {
         glass.wallpaperImage = snapshot;
     }
-    glass.cornerRadius           = LGAppLibCornerRadius();
-    glass.bezelWidth             = LGAppLibBezelWidth();
-    glass.glassThickness         = LGAppLibGlassThickness();
-    glass.refractionScale        = LGAppLibRefractionScale();
-    glass.refractiveIndex        = LGAppLibRefractiveIndex();
-    glass.specularOpacity        = LGAppLibSpecularOpacity();
-    glass.blur                   = LGAppLibBlur();
-    glass.wallpaperScale         = LGAppLibWallpaperScale();
-    glass.updateGroup            = LGUpdateGroupAppLibrary;
+    LGAppLibraryConfigureGlass(glass,
+                               LGAppLibCornerRadius(),
+                               LGAppLibBezelWidth(),
+                               LGAppLibGlassThickness(),
+                               LGAppLibRefractionScale(),
+                               LGAppLibRefractiveIndex(),
+                               LGAppLibSpecularOpacity(),
+                               LGAppLibBlur(),
+                               LGAppLibWallpaperScale());
     LGAppLibraryPreparePodChildren(host);
     LGEnsureAppLibraryTintOverlay(host,
                                   LGAppLibCornerRadius(),
@@ -251,18 +281,13 @@ static void injectIntoSearchBar(UIView *self_) {
     UIImage *snapshot = LG_getHomescreenSnapshot(&wallpaperOrigin);
     if (!snapshot) {
         LGAppLibraryRestoreOriginalState(self_);
-        // same deal for the search field path
-        if ([objc_getAssociatedObject(self_, kAppLibRetryKey) boolValue]) return;
-        objc_setAssociatedObject(self_, kAppLibRetryKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            objc_setAssociatedObject(self_, kAppLibRetryKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        LGAppLibraryScheduleRetry(self_, ^{
             injectIntoSearchBar(self_);
         });
         return;
     }
 
-    LGAppLibraryRememberOriginalState(self_);
+    LGAppLibraryPrepareHost(self_, LGAppLibSearchCornerRadius());
 
     LiquidGlassView *glass = objc_getAssociatedObject(self_, kAppLibGlassKey);
     if (!glass) {
@@ -276,15 +301,15 @@ static void injectIntoSearchBar(UIView *self_) {
     } else {
         glass.wallpaperImage = snapshot;
     }
-    glass.cornerRadius           = LGAppLibSearchCornerRadius();
-    glass.bezelWidth             = LGAppLibSearchBezelWidth();
-    glass.glassThickness         = LGAppLibSearchGlassThickness();
-    glass.refractionScale        = LGAppLibSearchRefractionScale();
-    glass.refractiveIndex        = LGAppLibSearchRefractiveIndex();
-    glass.specularOpacity        = LGAppLibSearchSpecularOpacity();
-    glass.blur                   = LGAppLibSearchBlur();
-    glass.wallpaperScale         = LGAppLibSearchWallpaperScale();
-    glass.updateGroup            = LGUpdateGroupAppLibrary;
+    LGAppLibraryConfigureGlass(glass,
+                               LGAppLibSearchCornerRadius(),
+                               LGAppLibSearchBezelWidth(),
+                               LGAppLibSearchGlassThickness(),
+                               LGAppLibSearchRefractionScale(),
+                               LGAppLibSearchRefractiveIndex(),
+                               LGAppLibSearchSpecularOpacity(),
+                               LGAppLibSearchBlur(),
+                               LGAppLibSearchWallpaperScale());
     LGEnsureAppLibraryTintOverlay(self_,
                                   LGAppLibSearchCornerRadius(),
                                   LGAppLibraryTintColorForView(self_,
@@ -343,6 +368,24 @@ static BOOL isInsideSearchTextField(UIView *view) {
         v = v.superview;
     }
     return NO;
+}
+
+static BOOL LGHandleSearchFieldMaterialView(UIView *view, BOOL updateOnly) {
+    if (!isInsideSearchTextField(view)) return NO;
+    if (!view.window || !LGAppLibraryEnabled()) {
+        LGRemoveAppLibraryGlass(view);
+        LGAppLibraryRestoreOriginalState(view);
+        return YES;
+    }
+    if (updateOnly) {
+        LiquidGlassView *glass = objc_getAssociatedObject(view, kAppLibGlassKey);
+        [glass updateOrigin];
+        LGAppLibraryPrepareHost(view, LGAppLibSearchCornerRadius());
+        return YES;
+    }
+    injectIntoSearchBar(view);
+    LGAppLibraryPrepareHost(view, LGAppLibSearchCornerRadius());
+    return YES;
 }
 
 %hook SBHLibraryCategoryPodBackgroundView
@@ -404,24 +447,7 @@ static BOOL isInsideSearchTextField(UIView *view) {
     %orig;
     UIView *self_ = (UIView *)self;
 
-    if (isInsideSearchTextField(self_)) {
-        if (!self_.window) {
-            LGRemoveAppLibraryGlass(self_);
-            LGAppLibraryRestoreOriginalState(self_);
-            return;
-        }
-        if (!LGAppLibraryEnabled()) {
-            LGRemoveAppLibraryGlass(self_);
-            LGAppLibraryRestoreOriginalState(self_);
-            return;
-        }
-        injectIntoSearchBar(self_);
-        self_.layer.cornerRadius = LGAppLibSearchCornerRadius();
-        if (@available(iOS 13.0, *))
-            self_.layer.cornerCurve = kCACornerCurveContinuous;
-        self_.clipsToBounds = YES;
-        return;
-    }
+    if (LGHandleSearchFieldMaterialView(self_, NO)) return;
 
     if (!self_.window) return;
     if (!LGAppLibraryEnabled()) return;
@@ -443,20 +469,7 @@ static BOOL isInsideSearchTextField(UIView *view) {
     %orig;
     UIView *self_ = (UIView *)self;
 
-    if (isInsideSearchTextField(self_)) {
-        if (!LGAppLibraryEnabled()) {
-            LGRemoveAppLibraryGlass(self_);
-            LGAppLibraryRestoreOriginalState(self_);
-            return;
-        }
-        LiquidGlassView *glass = objc_getAssociatedObject(self_, kAppLibGlassKey);
-        [glass updateOrigin];
-        self_.layer.cornerRadius = LGAppLibSearchCornerRadius();
-        if (@available(iOS 13.0, *))
-            self_.layer.cornerCurve = kCACornerCurveContinuous;
-        self_.clipsToBounds = YES;
-        return;
-    }
+    if (LGHandleSearchFieldMaterialView(self_, YES)) return;
 
     if (!LGAppLibraryEnabled()) return;
     static Class focusCls2, podCls2;

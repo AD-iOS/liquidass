@@ -29,7 +29,7 @@ static CADisplayLink *sWidgetLink = nil;
 static LGWidgetTicker *sWidgetTicker = nil;
 static NSInteger sWidgetCount = 0;
 
-static BOOL LGWidgetEnabled(void) { return LG_globalEnabled() && LG_prefBool(@"Widgets.Enabled", YES); }
+static BOOL LGWidgetEnabled(void) { return LG_globalEnabled() && LG_prefBool(@"Widgets.Enabled", NO); }
 static CGFloat LGWidgetCornerRadius(void) { return LG_prefFloat(@"Widgets.CornerRadius", 20.2); }
 static CGFloat LGWidgetBezelWidth(void) { return LG_prefFloat(@"Widgets.BezelWidth", 18.0); }
 static CGFloat LGWidgetGlassThickness(void) { return LG_prefFloat(@"Widgets.GlassThickness", 150.0); }

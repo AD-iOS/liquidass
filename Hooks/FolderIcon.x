@@ -21,12 +21,40 @@ static BOOL isInsideFolderIcon(UIView *view) {
 static void *kFolderIconRetryKey = &kFolderIconRetryKey;
 static void *kFolderIconGlassKey = &kFolderIconGlassKey;
 static void *kFolderIconTintKey = &kFolderIconTintKey;
+static void *kFolderIconLastPageKey = &kFolderIconLastPageKey;
 
 static void LGScheduleFolderSnapshotWarmup(NSTimeInterval delay) {
+    if (LG_getFolderSnapshot()) return;
     NSUInteger generation = ++sFolderSnapshotGeneration;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (generation != sFolderSnapshotGeneration) return;
+        if (LG_getFolderSnapshot()) return;
+        LG_cacheFolderSnapshot();
+    });
+}
+
+static BOOL LGFolderScrollIsSettled(UIScrollView *scrollView) {
+    if (!scrollView) return NO;
+    if (scrollView.dragging || scrollView.decelerating || scrollView.tracking) return NO;
+    CGFloat pageWidth = CGRectGetWidth(scrollView.bounds);
+    if (pageWidth <= 1.0) return YES;
+    CGFloat page = scrollView.contentOffset.x / pageWidth;
+    return fabs(page - round(page)) < 0.02;
+}
+
+static void LGScheduleFolderSnapshotWarmupForScroll(UIScrollView *scrollView, NSTimeInterval delay) {
+    if (!scrollView) return;
+    if (LG_getFolderSnapshot()) return;
+    NSUInteger generation = ++sFolderSnapshotGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation != sFolderSnapshotGeneration) return;
+        if (LG_getFolderSnapshot()) return;
+        if (!LGFolderScrollIsSettled(scrollView)) {
+            LGScheduleFolderSnapshotWarmupForScroll(scrollView, 0.12);
+            return;
+        }
         LG_cacheFolderSnapshot();
     });
 }
@@ -149,6 +177,26 @@ static void LGFolderIconRefreshAllHosts(void) {
     });
 }
 
+static NSInteger LGFolderScrollPageForOffset(UIScrollView *scrollView, CGPoint offset) {
+    CGFloat pageWidth = CGRectGetWidth(scrollView.bounds);
+    if (pageWidth <= 1.0) return 0;
+    return (NSInteger)llround(offset.x / pageWidth);
+}
+
+static void LGHandleFolderSnapshotForScroll(UIScrollView *scrollView, CGPoint offset) {
+    NSInteger page = LGFolderScrollPageForOffset(scrollView, offset);
+    NSNumber *lastPageNumber = objc_getAssociatedObject(scrollView, kFolderIconLastPageKey);
+    NSInteger lastPage = lastPageNumber ? lastPageNumber.integerValue : page;
+    if (!lastPageNumber) {
+        objc_setAssociatedObject(scrollView, kFolderIconLastPageKey, @(page), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else if (lastPage != page) {
+        objc_setAssociatedObject(scrollView, kFolderIconLastPageKey, @(page), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        LG_invalidateFolderSnapshot();
+        LGScheduleFolderSnapshotWarmupForScroll(scrollView, 0.18);
+    }
+    LG_updateRegisteredGlassViews(LGUpdateGroupFolderIcon);
+}
+
 static void LGFolderIconPrefsChanged(CFNotificationCenterRef center,
                                      void *observer,
                                      CFStringRef name,
@@ -206,14 +254,12 @@ static void LGFolderIconPrefsChanged(CFNotificationCenterRef center,
 
 - (void)setContentOffset:(CGPoint)offset {
     %orig;
-    LG_invalidateFolderSnapshot();
-    LG_updateRegisteredGlassViews(LGUpdateGroupFolderIcon);
+    LGHandleFolderSnapshotForScroll((UIScrollView *)self, offset);
 }
 
 - (void)setContentOffset:(CGPoint)offset animated:(BOOL)animated {
     %orig;
-    LG_invalidateFolderSnapshot();
-    LG_updateRegisteredGlassViews(LGUpdateGroupFolderIcon);
+    LGHandleFolderSnapshotForScroll((UIScrollView *)self, offset);
 }
 
 %end

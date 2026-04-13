@@ -57,12 +57,13 @@
 "prefs.section.main.title" = "Main Controls";
 "prefs.section.main.subtitle" = "Configure the tweak across each major surface.";
 "prefs.section.misc.title" = "Miscellaneous";
-"prefs.section.misc.subtitle" = "Respring and About (¯\\_(ツ)_/¯)";
+"prefs.section.misc.subtitle" = "Respring and More Options (¯\\_(ツ)_/¯)";
 
 "prefs.button.reset" = "Reset";
 "prefs.button.cancel" = "Cancel";
 "prefs.button.respring" = "Respring";
 "prefs.button.later" = "Later";
+"prefs.button.reopen_settings" = "Reopen";
 "prefs.button.ok" = "OK";
 "prefs.button.go_to_top" = "Go to top";
 "prefs.button.apply" = "Apply";
@@ -71,6 +72,8 @@
 "prefs.reset_confirm.body" = "This action will reset all preferences to their defaults. Do you wish to continue?";
 "prefs.respring_confirm.title" = "Confirm Respring";
 "prefs.respring_confirm.body" = "Do you wish to respring now? Any running background apps or processes might close if you do.";
+"prefs.reopen_settings.title" = "Reopen Settings";
+"prefs.reopen_settings.body" = "This change applies the next time Settings starts. Reopen Settings now?";
 "prefs.respring_bar.title" = "Respring Recommended";
 "prefs.respring_bar.subtitle" = "It is recommended to respring with the changes you made.";
 "prefs.info.title" = "Info";
@@ -93,5 +96,7 @@
 "prefs.surface.app_library.subtitle" = "Category pods and search field materials.";
 "prefs.misc.respring.title" = "Respring";
 "prefs.misc.respring.subtitle" = "Do a respring after any changes if on iOS 16 or later since live updating is broken.";
-"prefs.misc.about.title" = "About";
-"prefs.misc.about.subtitle" = "About the tweak, version details and supporting the author.";
+"prefs.misc.about.title" = "More Options";
+"prefs.misc.about.subtitle" = "Language, about, version details, donate, etc.";
+"prefs.misc.settings_controls.title" = "Settings Sliders and Switches";
+"prefs.misc.settings_controls.subtitle" = "Enable the custom liquid controls inside the Settings app. EXPERIMENTAL!";
