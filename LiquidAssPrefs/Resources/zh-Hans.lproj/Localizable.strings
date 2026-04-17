@@ -106,10 +106,6 @@
 "prefs.misc.options_section.subtitle" = "实验性功能及其他内容";
 "prefs.misc.language.title" = "语言";
 "prefs.misc.language.subtitle" = "选择此设置界面的语言";
-"prefs.misc.language.english.title" = "英语";
-"prefs.misc.language.english.subtitle" = "使用英语本地化";
-"prefs.misc.language.vietnamese.title" = "越南语";
-"prefs.misc.language.vietnamese.subtitle" = "使用越南语本地化";
 "prefs.misc.app_library_composite.title" = "资源库示例图标";
 "prefs.misc.app_library_composite.subtitle" = "在 App 资源库中同时采样主屏幕图标，而不仅是壁纸效果接近 iOS 26，但在某些布局下可能显示异常";
 "prefs.misc.lockscreen_clock.title" = "锁屏时钟";
